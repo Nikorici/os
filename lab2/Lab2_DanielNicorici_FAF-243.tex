@@ -1,0 +1,303 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{2}
+\newcommand{\labtitle}{Meet the OS You Will Build}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+The purpose of this lab is to build xv6, a small but real Unix written in about 9\,000 lines
+of C, from source; to boot it on an emulated RISC-V machine in QEMU; to use it as the tiny Unix
+it is; to read both sides of a system call (the program in \code{user/} that asks and the
+kernel code in \code{kernel/} that answers); and to add a first program of my own,
+\code{sleep}, that makes a real system call into the kernel I compiled.
+
+Environment: xv6 source \code{mit-pdos/xv6-riscv} at commit \code{06aad25} (2026-09-26),
+cross-compiled with \code{riscv64-linux-gnu-gcc} 16.2.1 and run on QEMU 11.1.1
+(\code{qemu-system-riscv64}), on my own laptop running Arch Linux.
+
+\section{Part 1. Build it and boot it}
+
+\begin{lstlisting}
+$ cd ~/xv6-riscv
+$ make qemu
+qemu-system-riscv64 -machine virt -bios none -kernel kernel/kernel -m 128M -smp 3 -nographic -global virtio-mmio.force-legacy=false -drive file=fs.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+
+xv6 kernel is booting
+
+hart 2 starting
+hart 1 starting
+init: starting sh
+$
+\end{lstlisting}
+
+\code{make qemu} compiles the kernel into \code{kernel/kernel}, compiles every user program
+listed in \code{UPROGS}, packs \code{README} and those programs into the disk image
+\code{fs.img}, and starts QEMU with that kernel and disk. The emulated machine is the RISC-V
+\code{virt} board with 128\,MB of RAM and 3 harts (hardware threads, i.e. CPU cores): hart 0
+boots the kernel, harts 1 and 2 report that they are starting, and then the first process,
+\code{init}, starts the shell. QEMU is left with \code{Ctrl-A} followed by \code{X}.
+
+\section{Part 2. Use xv6 as the Unix it is}
+
+\begin{lstlisting}
+$ ls
+.              1 1 1024
+..             1 1 1024
+README         2 2 2441
+cat            2 3 35912
+echo           2 4 34808
+forktest       2 5 17704
+grep           2 6 43336
+init           2 7 35152
+kill           2 8 34704
+ln             2 9 34504
+ls             2 10 41992
+mkdir          2 11 34760
+rm             2 12 34736
+sh             2 13 57120
+stressfs       2 14 35584
+usertests      2 15 201568
+grind          2 16 50384
+wc             2 17 36880
+zombie         2 18 34056
+logstress      2 19 36728
+forphan        2 20 35520
+dorphan        2 21 34976
+sync           2 22 34152
+sleep          2 23 34480
+console        3 24 0
+$ echo hello xv6
+hello xv6
+$ ls | grep c
+cat            2 3 35912
+echo           2 4 34808
+wc             2 17 36880
+sync           2 22 34152
+console        3 24 0
+$ wc README
+48 336 2441 README
+\end{lstlisting}
+
+The columns printed by xv6's \code{ls} are: name, type (1 = directory, 2 = file, 3 = device),
+inode number and size in bytes. \code{console} has type 3: the terminal is a device file, just
+like \code{/dev/tty} on Linux.
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Three programs xv6 ships with.} \code{ls}, \code{cat} and \code{grep}; the
+  image also contains \code{echo}, \code{wc}, \code{sh}, \code{mkdir}, \code{rm},
+  \code{kill}, \code{ln} and the test programs \code{usertests} and \code{forktest}.
+  \item \textbf{What a pipe needs.} First, \emph{processes}: the shell uses \code{fork} and
+  \code{exec} to create two processes, one running \code{ls} and one running \code{grep}, which
+  run at the same time. Second, \emph{inter-process communication}: the \code{pipe} system call
+  creates a kernel buffer with a write end and a read end, and the shell uses \code{close} and
+  \code{dup} to connect the standard output of \code{ls} to the write end and the standard
+  input of \code{grep} to the read end (\code{user/sh.c}, lines 103--113).
+  \item \textbf{xv6 shell vs.\ Linux shell.} For simple commands the xv6 shell behaves like
+  bash (programs, pipes, \code{>}/\code{<} redirection, \code{;} and \code{\&}), but it is much
+  more minimal: no history, no Tab completion, no variables, no \code{*} globbing, and the
+  prompt is just \code{\$}.
+\end{enumerate}
+
+\section{Part 3. Read the source}
+
+\subsection{System calls in user/cat.c}
+
+\begin{lstlisting}[style=ccode]
+#include "kernel/types.h"
+#include "kernel/fcntl.h"
+#include "user/user.h"
+
+char buf[512];
+
+void
+cat(int fd)
+{
+  int n;
+
+  while ((n = read(fd, buf, sizeof(buf))) > 0) {
+    if (write(1, buf, n) != n) {
+      fprintf(2, "cat: write error\n");
+      exit(1);
+    }
+  }
+  if (n < 0) {
+    fprintf(2, "cat: read error\n");
+    exit(1);
+  }
+}
+\end{lstlisting}
+
+\subsection{Where the kernel implements read and write}
+
+\begin{lstlisting}
+$ grep -n "sys_read\|sys_write" kernel/sysfile.c
+69:sys_read(void)
+83:sys_write(void)
+\end{lstlisting}
+
+\begin{lstlisting}[style=ccode,firstnumber=68]
+uint64
+sys_read(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+
+  argaddr(1, &p);
+  argint(2, &n);
+  if (argfd(0, 0, &f) < 0)
+    return -1;
+  return fileread(f, p, n);
+}
+\end{lstlisting}
+
+\subsection{How a call crosses from user/ into kernel/}
+
+On the user side, \code{read} is not C code at all. The script \code{user/usys.pl} generates
+a three-instruction stub for every system call in \code{user/usys.S}: it loads the call
+number into register \code{a7} and executes \code{ecall}, which traps into the kernel.
+
+\begin{lstlisting}
+$ grep -A3 "^read:" user/usys.S
+read:
+ li a7, SYS_read
+ ecall
+ ret
+\end{lstlisting}
+
+In the kernel, \code{syscall()} reads that number back from the saved registers and calls the
+matching function from its table (\code{[SYS\_read] = sys\_read} on line 115, with
+\code{SYS\_read} = 5 defined in \code{kernel/syscall.h}). The return value is stored in
+\code{a0}, which is where the user program finds it.
+
+\begin{lstlisting}[style=ccode,firstnumber=136]
+void
+syscall(void)
+{
+  int num;
+  struct proc *p = myproc();
+
+  num = p->trapframe->a7;
+  if (num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    // Use num to lookup the system call function for num, call it,
+    // and store its return value in p->trapframe->a0
+    p->trapframe->a0 = syscalls[num]();
+  } else {
+    printk("%d %s: unknown sys call %d\n", p->pid, p->name, num);
+    p->trapframe->a0 = -1;
+  }
+}
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{System calls used by \code{user/cat.c}.} \code{open(path, O\_RDONLY)} asks the
+  kernel to find a file by name and return a file descriptor; \code{read(fd, buf, 512)} asks
+  it to copy up to 512 bytes from that file into \code{buf} (it returns the number of bytes,
+  0 at end of file, $-1$ on error); \code{write(1, buf, n)} asks it to copy \code{n} bytes to
+  file descriptor 1, the console; \code{close(fd)} releases the descriptor; \code{exit(status)}
+  ends the process and passes the status to the parent's \code{wait}. \code{fprintf} is not a
+  system call: it is a library function in \code{user/printf.c} that formats the text and then
+  calls \code{write} on descriptor 2.
+  \item \textbf{Where \code{sys\_read} is implemented.} In \code{kernel/sysfile.c}, line 69
+  (with its return type \code{uint64} on line 68); \code{sys\_write} follows on line 83.
+  \item \textbf{\code{kernel/} vs.\ \code{user/}.} The code in \code{kernel/} runs in
+  privileged (supervisor) mode with access to all memory and hardware and provides the
+  services; the code in \code{user/} runs as ordinary, isolated programs that can only obtain
+  those services by asking the kernel through system calls.
+\end{enumerate}
+
+\section{Part 4. Write your first xv6 program}
+
+\subsection{Implementation}
+
+In August 2025 the xv6 authors renamed the user system call \code{sleep()} to
+\code{pause()} (upstream commit \code{f5dea58}, which also renamed kernel functions such as
+\code{fork} to \code{kfork} and \code{exit} to \code{kexit}). On the current tree
+\code{user/user.h} declares only \code{int pause(int);}, so the handout's version, which calls
+\code{sleep()}, does not build. My program therefore calls \code{pause()}:
+
+\begin{lstlisting}[style=ccode]
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  if(argc != 2){
+    fprintf(2, "usage: sleep <ticks>\n");
+    exit(1);
+  }
+  pause(atoi(argv[1]));
+  exit(0);
+}
+\end{lstlisting}
+
+\code{argv[0]} is the program name and \code{argv[1]} the number of ticks, so any other
+argument count is a usage error: the message goes to file descriptor 2 (standard error) and
+\code{exit(1)} reports the failure to the parent shell.
+
+\subsection{Adding the program to the build}
+
+\begin{lstlisting}
+$ git diff Makefile
+diff --git a/Makefile b/Makefile
+index af1e7a5..089e215 100644
+--- a/Makefile
++++ b/Makefile
+@@ -150,6 +150,7 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++	$U/_sleep\
+
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+\end{lstlisting}
+
+User programs are built as \code{user/\_name}; \code{mkfs} strips the leading underscore when
+it copies them into \code{fs.img} (\code{mkfs/mkfs.c}, line 147), so inside xv6 the program is
+simply \code{sleep}. Without the \code{UPROGS} line the program is never compiled or copied, and
+the shell answers \code{exec sleep failed}.
+
+\subsection{Testing}
+
+\begin{lstlisting}
+$ sleep 10
+$ sleep
+usage: sleep <ticks>
+$ sleep abc 2
+usage: sleep <ticks>
+\end{lstlisting}
+
+To check that the program really waits rather than returning at once, I timed it from the
+host: after typing \code{sleep 50; echo done} the prompt line appeared at 41.46\,s and
+\code{done} at 46.42\,s, a pause of 4.96\,s. One xv6 tick is about 0.1\,s (the kernel arms
+the next timer interrupt 1\,000\,000 cycles ahead, \code{kernel/trap.c}, line 179), so 50 ticks
+$\approx$ 5\,s, as expected.
+
+\plainsection{Conclusions}
+
+I built xv6 from source, booted it in QEMU and used it as a small Unix with the same basic tools
+and pipes as Linux. Reading the source showed the split at the heart of every operating system:
+programs in \code{user/} only ask, and the kernel in \code{kernel/} does the privileged work.
+
+My \code{sleep} program crosses that boundary for real. When it calls \code{pause(10)}, the
+argument goes into register \code{a0}, and the stub in \code{user/usys.S} loads the call number
+13 into \code{a7} and executes \code{ecall}. The CPU switches to supervisor mode,
+\code{uservec} saves the user registers, \code{usertrap()} recognises a system call, and
+\code{syscall()} uses \code{a7} to call \code{sys\_pause}, which waits for ten timer ticks. The
+result travels back in \code{a0}, the CPU returns to user mode, and the program exits. Every
+service a program gets from the OS, from reading a file to sleeping, follows this same path.
+
+\end{document}
