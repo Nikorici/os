@@ -1,0 +1,430 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{4}
+\newcommand{\labtitle}{The xv6 Shell from the Outside}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+The whole user interface of xv6 is one program, \code{user/sh.c}. The purpose of this lab is to
+use it side by side with bash and find out, by experiment, what a shell must do and what bash
+adds on top; to write a small program that prints the arguments it receives, which shows
+exactly who expands \code{*} and who removes quotes; and to read the parts of \code{sh.c} that
+explain what was observed. First, the \code{sleep} program from Lab 2 is checked against the
+current xv6.
+
+The work was done on my own laptop running Arch Linux: xv6 (\code{mit-pdos/xv6-riscv}, commit
+\code{06aad25}) cross-compiled with \code{riscv64-linux-gnu-gcc} 16.2.1 and run on QEMU
+11.1.1, and on the Linux side GNU bash 5.3.15 and gcc 16.1.1.
+
+\section{Part 1. Fix sleep for the current xv6}
+
+In August 2025 the xv6 authors renamed the system call \code{sleep()} to \code{pause()}. My
+tree declares only \code{pause}, and my \code{sleep.c} from Lab 2 already calls \code{pause()},
+so it builds without changes; \code{\$U/\_sleep\textbackslash} is on line 153 of the Makefile.
+
+\begin{lstlisting}[caption={The grep result in user.h}]
+$ cd ~/xv6-riscv
+$ grep -n "pause\|sleep" user/user.h
+25:int pause(int);
+\end{lstlisting}
+
+\begin{lstlisting}[style=ccode,caption={The updated sleep.c}]
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  if(argc != 2){
+    fprintf(2, "usage: sleep <ticks>\n");
+    exit(1);
+  }
+  pause(atoi(argv[1]));
+  exit(0);
+}
+\end{lstlisting}
+
+\needspace{17\baselineskip}
+\begin{lstlisting}[caption={sleep running in xv6, with and without an argument}]
+$ make qemu
+qemu-system-riscv64 -machine virt -bios none -kernel kernel/kernel -m 128M -smp 3 -nographic -global virtio-mmio.force-legacy=false -drive file=fs.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+
+xv6 kernel is booting
+
+hart 2 starting
+hart 1 starting
+init: starting sh
+$ sleep 20
+$ sleep
+usage: sleep <ticks>
+\end{lstlisting}
+
+\code{sleep 20} pauses for 20 ticks (about 2 seconds) before the prompt returns; without an
+argument the program prints its usage message to standard error and exits with status 1.
+
+\section{Part 2. bash versus the xv6 shell}
+
+Every command was run twice: in bash, in an empty folder \code{\textasciitilde/shtest} containing
+only \code{README}, and at the xv6 prompt. Table 2.1 summarises what each shell printed.
+
+\begin{table}[H]
+  \centering
+  \caption{The same commands in bash and in the xv6 shell}
+  \footnotesize
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.25\textwidth}>{\raggedright\arraybackslash}p{0.13\textwidth}>{\raggedright\arraybackslash}p{0.25\textwidth}>{\raggedright\arraybackslash}p{0.29\textwidth}@{}}
+    \toprule
+    \textbf{Command} & \textbf{Tests} & \textbf{bash} & \textbf{xv6} \\
+    \midrule
+    \code{echo hello > f ; cat < f} & redirection & \code{hello} & \code{hello} \\
+    \code{ls | grep READ} & pipe & \code{README} & \code{README 2 2 2441} \\
+    \code{(echo a; echo b) | wc} & grouping, list & \code{2 2 4} & \code{2 2 4} \\
+    \code{echo one ; echo two} & sequence & \code{one}, \code{two} & \code{one}, \code{two} \\
+    \code{echo bg \&} & background & \code{[1] 135185}, \code{bg}, later \code{[1]+ Done} & \code{bg}, no job number \\
+    \code{ls *} & globbing & \code{README  f} & \code{ls: cannot open *} \\
+    \code{echo \$HOME} & variables & \code{/home/Nico} & \code{\$HOME} \\
+    \code{echo "a b"} & quotes & \code{a b} & \code{"a b"} \\
+    \code{mkdir d ; cd d ; ls ..} & PATH & \code{README  d  f} & \code{exec cd failed}, then \code{ls} lists \code{/}; after a separate \code{cd d}: \code{exec ls failed} \\
+    arrow up, Tab, Ctrl+R & history, completion & recalls, completes, searches & \code{exec \textasciicircum{}[[A failed}, \code{exec ech failed}, \code{exec \textasciicircum{}Rtwo failed} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{lstlisting}[caption={The commands run in bash}]
+$ mkdir ~/shtest && cd ~/shtest && touch README
+$ echo hello > f ; cat < f
+hello
+$ ls | grep READ
+README
+$ (echo a; echo b) | wc
+      2       2       4
+$ echo one ; echo two
+one
+two
+$ echo bg &
+[1] 135185
+$ bg
+ls *
+README  f
+[1]+  Done                       echo bg
+$ echo $HOME
+/home/Nico
+$ echo "a b"
+a b
+$ mkdir d ; cd d ; ls ..
+README  d  f
+$ mkdir d ; cd d ; ls ..
+d
+$ echo  one
+one
+(reverse-i-search)`two': echo one ; echo two
+one
+two
+\end{lstlisting}
+
+In bash the background \code{echo} printed \code{bg} only after the next prompt had appeared,
+so it shows up after \code{\$}, and the job's \code{Done} line came after the following
+command. The last three commands test the keyboard: the arrow-up key recalled the previous line,
+and running it again created \code{d/d} and listed it; typing \code{ech} and Tab completed the
+word to \code{echo} plus a space; Ctrl+R followed by \code{two} found
+\code{echo one ; echo two} in the history and ran it again.
+
+\begin{lstlisting}[caption={The same commands run in xv6}]
+$ echo hello > f ; cat < f
+hello
+$ ls | grep READ
+README         2 2 2441
+$ (echo a; echo b) | wc
+2 2 4
+$ echo one ; echo two
+one
+two
+$ echo bg &
+bg
+$ ls *
+ls: cannot open *
+$ echo $HOME
+$HOME
+$ echo "a b"
+"a b"
+$ ^[[A
+exec ^[[A failed
+$ ech[Tab] one
+exec ech failed
+$ ^Rtwo
+exec ^Rtwo failed
+\end{lstlisting}
+
+In xv6 the special keys are not interpreted: the arrow key arrives as the raw characters
+\code{ESC [ A} (shown as \code{\textasciicircum{}[[A}), Tab is just a space-like character that ends the word
+\code{ech}, and Ctrl+R is the raw character \code{\textasciicircum{}R}. The shell treats each of them as part
+of a program name and fails to run it.
+
+\begin{lstlisting}[caption={ls failing after cd d, and the working alternative}]
+$ mkdir d ; cd d ; ls ..
+exec cd failed
+.              1 1 1024
+..             1 1 1024
+README         2 2 2441
+[... 23 entries omitted ...]
+f              2 26 6
+d              1 27 32
+$ cd d
+$ ls ..
+exec ls failed
+$ /ls ..
+.              1 1 1024
+..             1 1 1024
+README         2 2 2441
+[... 23 entries omitted ...]
+f              2 26 6
+d              1 27 32
+$ cd /
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Common features and bash-only features.} Both shells run programs with
+  arguments, redirect input and output with \code{<} and \code{>}, connect programs with
+  \code{|}, run sequences with \code{;}, group commands with \code{( )} and start background
+  commands with \code{\&}. Only bash has globbing, variables, quoting, a PATH search, \code{cd}
+  anywhere on the line, job numbers and \code{Done} messages, command history, Tab completion
+  and Ctrl+R search.
+  \item \textbf{Why \code{ls} stops working after \code{cd d}.} The xv6 shell passes the
+  program name straight to \code{exec}, which looks it up relative to the current directory,
+  and there is no PATH. All xv6 programs live in the root directory \code{/}, so after
+  \code{cd d} the name \code{ls} no longer points to a file and the shell prints
+  \code{exec ls failed}. The fix is to give the full path, \code{/ls ..} (or \code{../ls ..}).
+  The first line also shows a second limitation: \code{cd} inside a \code{;} list is not
+  recognised and fails with \code{exec cd failed} (explained in Part 4).
+  \item \textbf{What I would miss most, and what is easiest to add.} In daily work I would miss
+  history and Tab completion the most, because they save the most typing. The easiest feature
+  to add is a PATH-like fallback: when \code{exec} fails and the name contains no \code{/}, the
+  shell could retry with \code{/} in front of the name, which takes only a few lines in
+  \code{runcmd}.
+\end{enumerate}
+
+\section{Part 3. Who expands *? A program that prints its argv}
+
+\begin{lstlisting}[caption={args.c and the UPROGS line}]
+$ cat user/args.c
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  printf("argc = %d\n", argc);
+  for(int i = 0; i < argc; i++)
+    printf("argv[%d] = [%s]\n", i, argv[i]);
+  exit(0);
+}
+$ grep -n "_sleep\|_args" Makefile
+153:	$U/_sleep\
+154:	$U/_args\
+\end{lstlisting}
+
+\begin{lstlisting}[caption={args output in xv6}]
+$ args one              two         three
+argc = 4
+argv[0] = [args]
+argv[1] = [one]
+argv[2] = [two]
+argv[3] = [three]
+$ args *.c "x y"
+argc = 4
+argv[0] = [args]
+argv[1] = [*.c]
+argv[2] = ["x]
+argv[3] = [y"]
+$ args $HOME
+argc = 2
+argv[0] = [args]
+argv[1] = [$HOME]
+$ args 'single quoted'
+argc = 3
+argv[0] = [args]
+argv[1] = ['single]
+argv[2] = [quoted']
+\end{lstlisting}
+
+\begin{lstlisting}[caption={args\_linux output in bash}]
+$ cat args_linux.c
+#include <stdio.h>
+
+int
+main(int argc, char *argv[])
+{
+  printf("argc = %d\n", argc);
+  for(int i = 0; i < argc; i++)
+    printf("argv[%d] = [%s]\n", i, argv[i]);
+  return 0;
+}
+$ gcc -Wall -o args args_linux.c
+$ ls *.c
+args.c  args_linux.c  sleep.c
+$ ./args one              two         three
+argc = 4
+argv[0] = [./args]
+argv[1] = [one]
+argv[2] = [two]
+argv[3] = [three]
+$ ./args *.c "x y"
+argc = 5
+argv[0] = [./args]
+argv[1] = [args.c]
+argv[2] = [args_linux.c]
+argv[3] = [sleep.c]
+argv[4] = [x y]
+$ ./args $HOME
+argc = 2
+argv[0] = [./args]
+argv[1] = [/home/Nico]
+$ ./args 'single quoted'
+argc = 2
+argv[0] = [./args]
+argv[1] = [single quoted]
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{\code{args *.c "x y"} in both shells.} In xv6 the program received 4 arguments:
+  \code{args}, \code{*.c}, \code{"x} and \code{y"}. In bash it received 5: \code{./args}, the
+  three file names \code{args.c}, \code{args\_linux.c}, \code{sleep.c}, and \code{x y} as a
+  single argument without quotes.
+  \item \textbf{Who expands \code{*} and removes quotes.} The shell. The program is the same in
+  both cases and only prints what it is given, and the kernel's \code{exec} only copies the
+  argument strings it receives. Bash replaced \code{*.c} with the matching names and removed the
+  quotes before calling \code{exec}; the xv6 shell does neither, so the program received the
+  raw text. The same happened with \code{\$HOME} (expanded only by bash) and
+  \code{\textquotesingle{}single quoted\textquotesingle{}} (one argument in bash, two in xv6).
+  \item \textbf{The extra spaces in \code{one two three}.} They disappeared in both shells:
+  both split the line at runs of whitespace, so spaces only separate arguments and are never
+  part of them, and both programs received \code{argc = 4}.
+\end{enumerate}
+
+\section{Part 4. Read the shell}
+
+\begin{lstlisting}[caption={The command kinds defined in sh.c}]
+$ wc -l user/sh.c
+499 user/sh.c
+$ grep -n "#define" user/sh.c
+8:#define EXEC  1
+9:#define REDIR 2
+10:#define PIPE  3
+11:#define LIST  4
+12:#define BACK  5
+14:#define MAXARGS 10
+$ grep -n "symbols\[\]\|whitespace\[\]" user/sh.c
+268:char whitespace[] = " \t\r\n\v";
+269:char symbols[] = "<|>&;()";
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Where each kind is run}]
+$ grep -n "case " user/sh.c
+75:  case EXEC:
+83:  case REDIR:
+93:  case LIST:
+101:  case PIPE:
+125:  case BACK:
+284:  case 0:
+286:  case '|':
+287:  case '(':
+288:  case ')':
+289:  case ';':
+290:  case '&':
+291:  case '<':
+294:  case '>':
+391:    case '<':
+394:    case '>':
+397:    case '+': // >>
+469:  case EXEC:
+475:  case REDIR:
+481:  case PIPE:
+487:  case LIST:
+493:  case BACK:
+\end{lstlisting}
+
+Lines 75--125 are \code{runcmd()}, which executes each kind; lines 284--294 are the tokenizer
+\code{gettoken()}, which recognises the special characters; lines 391--397 parse
+redirections; and lines 469--493 are \code{nulterminate()}. Searching for \code{cd} finds only
+the error message on line 170, because the check compares single characters:
+
+\begin{lstlisting}
+$ grep -n "cd" user/sh.c | head
+170:        fprintf(2, "cannot cd %s\n", cmd + 3);
+\end{lstlisting}
+
+\begin{lstlisting}[style=ccode,firstnumber=159,caption={The code that handles cd}]
+  // Read and run input commands.
+  while (getcmd(buf, sizeof(buf)) >= 0) {
+    char *cmd = buf;
+    while (*cmd == ' ' || *cmd == '\t')
+      cmd++;
+    if (*cmd == '\n') // is a blank command
+      continue;
+    if (cmd[0] == 'c' && cmd[1] == 'd' && cmd[2] == ' ') {
+      // Chdir must be called by the parent, not the child.
+      cmd[strlen(cmd) - 1] = 0; // chop \n
+      if (chdir(cmd + 3) < 0)
+        fprintf(2, "cannot cd %s\n", cmd + 3);
+    } else {
+      if (fork1() == 0)
+        runcmd(parsecmd(cmd));
+      wait(0);
+    }
+  }
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Searching sh.c for code that handles * or \$}]
+$ grep -n "'\*'\|'\$'\|glob\|getenv" user/sh.c || echo "(no matches)"
+(no matches)
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{The five kinds of command.} \code{EXEC} is a plain command, produced by
+  ordinary words with no special character (\code{ls ..}); \code{REDIR} is produced by
+  \code{<}, \code{>} and \code{>>} (which the tokenizer turns into \code{+}); \code{PIPE} by
+  \code{|}; \code{LIST} by \code{;}; and \code{BACK} by \code{\&}. Parentheses only group
+  commands and are not a kind of their own.
+  \item \textbf{Where \code{cd} is handled, and why not as a program.} In \code{main()}, lines
+  166--171: if a line starts with \code{cd }, the shell itself calls \code{chdir} and does not
+  fork. The current directory belongs to a process, so if a child process changed directory,
+  the change would disappear when the child exits and the shell would stay where it was. Because
+  the check only looks at the start of the line, \code{mkdir d ; cd d ; ls ..} goes to
+  \code{runcmd()} instead, where \code{cd} is treated as a program and fails with
+  \code{exec cd failed}, exactly as seen in Part 2.
+  \item \textbf{Code for \code{*} or \code{\$}.} There is none. The only special characters
+  the shell knows are \code{symbols[] = "<|>\&;()"} plus whitespace. This explains Part 2:
+  \code{ls *} received a literal \code{*}, \code{echo \$HOME} printed \code{\$HOME}, and
+  quotes stayed inside the arguments because they are ordinary characters to this shell.
+\end{enumerate}
+
+\plainsection{Conclusions}
+
+Running the same commands in two shells separated what a shell must do from what bash adds for
+comfort. The essential part is small: read a line, split it into words, recognise a handful of
+special characters, and turn them into the five kinds of command that \code{sh.c} defines,
+which it then runs with \code{fork}, \code{exec}, \code{pipe}, \code{dup} and \code{chdir}.
+In 499 lines of C, xv6 already supports programs, redirection, pipes, sequences, grouping and
+background jobs.
+
+Everything else in bash, such as globbing, variables, quotes, PATH search, history and
+completion, is convenience implemented inside the shell, not in the programs and not in the
+kernel. The \code{args} program proved this directly: the same code printed \code{*.c} and the
+quotes literally under xv6, and the expanded file names under bash. The experiment with
+\code{cd} showed the one thing a shell cannot delegate to a child process, because the current
+directory belongs to the process that changes it. Finally, the renaming of \code{sleep} to
+\code{pause} was a reminder that the interface between user programs and the kernel is defined
+by \code{user.h}, and code has to follow it when it changes.
+
+\end{document}
