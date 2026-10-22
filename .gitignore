@@ -1,0 +1,9 @@
+assignments/
+*.aux
+*.log
+*.toc
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+.~lock.*#
