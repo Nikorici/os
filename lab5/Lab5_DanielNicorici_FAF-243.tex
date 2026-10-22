@@ -1,0 +1,453 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{5}
+\newcommand{\labtitle}{The File System with Your Own Hands}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+The purpose of this lab is to check, on my own Linux laptop, everything from the lecture about
+file systems: the directory tree and the file types, the inodes that stand behind file names,
+hard and symbolic links, permissions, and the disks underneath, including the parts of the kernel
+that are shown as files under \code{/proc}. There is no programming: only commands, careful
+observation and short explanations.
+
+The work was done on Arch Linux (kernel 7.0.12, ext4 root file system) in GNU bash 5.3.15, as my
+normal user and not as root, because root ignores most permission checks and the experiments in
+Part 3 would not show anything. All experiments ran in a fresh folder \code{\textasciitilde/os-lab5-run}.
+
+\begin{lstlisting}
+$ whoami
+Nico
+$ mkdir -p ~/os-lab5-run && cd ~/os-lab5-run
+\end{lstlisting}
+
+\section{Part 1. The tree and the file types}
+
+\begin{lstlisting}[caption={The root of the tree}]
+$ ls /
+bin   dev  home  lib64       luminis-front  opt   root  sbin  sys  usr
+boot  etc  lib   lost+found  mnt            proc  run   srv   tmp  var
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The type of five paths}]
+$ ls -ld /etc /etc/passwd /bin /dev/null /tmp
+lrwxrwxrwx  1 root root    7 Oct 12  2025 /bin -> usr/bin
+crw-rw-rw-  1 root root 1, 3 Oct 12 13:13 /dev/null
+drwxr-xr-x 92 root root 4096 Oct 12 15:39 /etc
+-rw-r--r--  1 root root 1647 Sep 17 14:29 /etc/passwd
+drwxrwxrwt 29 root root  920 Oct 12 16:09 /tmp
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Devices in /dev}]
+$ ls -l /dev | head
+total 0
+drwxr-xr-x   2 root root           60 Oct 12 13:13 accel
+crw-r--r--   1 root root    10,   235 Oct 12 13:13 autofs
+drwxr-xr-x   2 root root          160 Oct 12 13:13 block
+crw-rw----   1 root disk    10,   234 Oct 12 13:13 btrfs-control
+drwxr-xr-x   3 root root           60 Oct 12 13:13 bus
+drwxr-xr-x   2 root root         5640 Oct 12 15:27 char
+crw-------   1 root root     5,     1 Oct 12 13:13 console
+lrwxrwxrwx   1 root root           11 Oct 12 13:13 core -> /proc/kcore
+drwxr-xr-x  18 root root          360 Oct 12 13:13 cpu
+$ ls -l /dev | grep '^b'
+brw-rw----   1 root disk   259,     0 Oct 12 13:13 nvme0n1
+brw-rw----   1 root disk   259,     1 Oct 12 13:13 nvme0n1p1
+brw-rw----   1 root disk   259,     2 Oct 12 13:13 nvme0n1p2
+brw-rw----   1 root disk   259,     3 Oct 12 13:13 nvme0n1p3
+brw-rw----   1 root disk   259,     4 Oct 12 13:13 nvme0n1p4
+brw-rw----   1 root disk   259,     5 Oct 12 13:13 nvme0n1p5
+\end{lstlisting}
+
+\begin{lstlisting}[caption={file looks at the content, not the name}]
+$ file /usr/bin/ls /etc/passwd /bin
+/usr/bin/ls: ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=c988ae960e91ea3f9f7b9cbbc2e3e4ffc0353796, for GNU/Linux 4.4.0, stripped
+/etc/passwd: ASCII text
+/bin:        symbolic link to usr/bin
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Disk usage of /var/log and /usr}]
+$ du -sh /var/log 2>/dev/null ; du -sh /usr 2>/dev/null
+1.4G	/var/log
+20G	/usr
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Types from the first letter of \code{ls -l}.} \code{/etc} is \code{d}, a
+  directory; \code{/etc/passwd} is \code{-}, a regular file; \code{/bin} is \code{l}, a symbolic
+  link; \code{/dev/null} is \code{c}, a character device; \code{/tmp} is \code{d}, a directory
+  (its permissions end in \code{t}, explained in Part 3).
+  \item \textbf{What \code{/bin} is.} It is a symbolic link to \code{usr/bin}. Arch keeps all
+  programs in \code{/usr/bin}, and the old path \code{/bin} survives only as a link so that old
+  scripts keep working; \code{file} confirms it: \code{symbolic link to usr/bin}.
+  \item \textbf{Devices.} A character device: \code{/dev/null} (\code{c}, numbers
+  \code{1, 3}), a byte stream that discards everything written to it. A block device:
+  \code{/dev/nvme0n1} (\code{b}, numbers \code{259, 0}), my whole SSD, read and written in
+  blocks; \code{nvme0n1p1} to \code{nvme0n1p5} are its partitions. The two numbers shown instead
+  of a size are the major number (which driver) and the minor number (which device).
+  \item \textbf{\code{/var/log} vs.\ \code{/usr}.} \code{/usr} uses 20\,GB and \code{/var/log}
+  1.4\,GB, so \code{/usr}, which holds every installed program and library, is about 14 times
+  bigger.
+\end{enumerate}
+
+\section{Part 2. Inodes and links}
+
+\begin{lstlisting}[caption={An inode, and a name that is not part of it}]
+$ echo hello > notes.txt
+$ stat notes.txt
+  File: notes.txt
+  Size: 6         	Blocks: 8          IO Block: 4096   regular file
+Device: 259,5	Inode: 4194703     Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/    Nico)   Gid: ( 1000/    Nico)
+Access: 2026-10-12 16:10:08.938495542 +0300
+Modify: 2026-10-12 16:10:08.938495542 +0300
+Change: 2026-10-12 16:10:08.938495542 +0300
+ Birth: 2026-10-12 16:10:08.938495542 +0300
+$ ls -li notes.txt
+4194703 -rw-r--r-- 1 Nico Nico 6 Oct 12 16:10 notes.txt
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Hard link, then removing the original}]
+$ ln notes.txt hard.txt
+$ ls -li notes.txt hard.txt
+4194703 -rw-r--r-- 2 Nico Nico 6 Oct 12 16:10 hard.txt
+4194703 -rw-r--r-- 2 Nico Nico 6 Oct 12 16:10 notes.txt
+$ rm notes.txt
+$ cat hard.txt ; ls -li hard.txt
+hello
+4194703 -rw-r--r-- 1 Nico Nico 6 Oct 12 16:10 hard.txt
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Symbolic link, then removing its target}]
+$ ln -s hard.txt soft.txt
+$ ls -li hard.txt soft.txt
+4194703 -rw-r--r-- 1 Nico Nico 6 Oct 12 16:10 hard.txt
+4194705 lrwxrwxrwx 1 Nico Nico 8 Oct 12 16:10 soft.txt -> hard.txt
+$ cat soft.txt
+hello
+$ rm hard.txt
+$ cat soft.txt ; ls -l soft.txt
+cat: soft.txt: No such file or directory
+lrwxrwxrwx 1 Nico Nico 8 Oct 12 16:10 soft.txt -> hard.txt
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Link counts of a directory}]
+$ mkdir d ; ls -ld d
+drwxr-xr-x 2 Nico Nico 4096 Oct 12 16:10 d
+$ mkdir d/x d/y ; ls -ld d
+drwxr-xr-x 4 Nico Nico 4096 Oct 12 16:10 d
+$ ls -ai d d/x
+d:
+4194703 .  4194700 ..  4194708 x  4194711 y
+
+d/x:
+4194708 .  4194703 ..
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Size is not space}]
+$ echo x > one.txt ; ls -l one.txt ; du -h one.txt
+-rw-r--r-- 1 Nico Nico 2 Oct 12 16:10 one.txt
+4.0K	one.txt
+$ truncate -s 1G big.img ; ls -lh big.img ; du -h big.img
+-rw-r--r-- 1 Nico Nico 1.0G Oct 12 16:10 big.img
+0	big.img
+$ rm big.img
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Inode and link count in \code{stat}.} \code{Inode: 4194703} is the inode
+  number, the identity of the file on the disk. \code{Links: 1} tells how many names (directory
+  entries) point to that inode. \code{ls -li} shows the same two numbers: the inode in the first
+  column and the link count right after the permissions.
+  \item \textbf{Why \code{hard.txt} survived \code{rm notes.txt}.} \code{ln} did not copy
+  anything: it added a second directory entry pointing to the same inode, so both names show
+  inode 4194703 and the link count became 2. \code{rm} removes only a \emph{name}: it deleted the
+  entry \code{notes.txt} and lowered the count to 1, while the inode and its data stayed, still
+  reachable through \code{hard.txt}. The data is freed only when the link count reaches 0 and no
+  program has the file open.
+  \item \textbf{Why \code{cat soft.txt} failed.} A symbolic link is a separate file with its own
+  inode (4194705) whose only content is the path text \code{hard.txt}. After \code{rm hard.txt}
+  no file with that name exists, so following the link leads nowhere (a dangling link), although
+  \code{soft.txt} itself still exists. Its size is exactly 8 bytes because \code{hard.txt} has 8
+  characters. The inode number 4194703 was freed when its last name was removed, and the very next
+  \code{mkdir d} received it again, as Figure 2.4 shows.
+  \item \textbf{Directory links.} A new directory has 2 links: its name \code{d} in the parent
+  directory, and its own entry \code{.}, which points to itself. Each subdirectory adds one more,
+  because its \code{..} entry points back to \code{d}: with \code{x} and \code{y} the count
+  becomes 4. \code{ls -ai} proves it: \code{d/.} and \code{d/x/..} both have inode 4194703.
+  \item \textbf{Size vs.\ space.} \code{one.txt} contains 2 bytes (\code{x} and a newline), but
+  the file system hands out space in whole 4\,KiB blocks (\code{IO Block: 4096}), so even 2 bytes
+  occupy one block: 4.0K. \code{truncate -s 1G} only set the length of \code{big.img} to 1\,GB
+  without writing anything, which creates a sparse file: the missing parts are holes that read
+  as zeros but have no blocks behind them, so \code{du} reports 0.
+\end{enumerate}
+
+\section{Part 3. Permissions}
+
+\begin{lstlisting}[caption={Permissions of a file}]
+$ echo secret > s.txt
+$ chmod 600 s.txt ; ls -l s.txt
+-rw------- 1 Nico Nico 7 Oct 12 16:10 s.txt
+$ chmod 000 s.txt ; cat s.txt
+cat: s.txt: Permission denied
+$ chmod u+r s.txt ; cat s.txt
+secret
+\end{lstlisting}
+
+\begin{lstlisting}[caption={umask and the permissions of new files}]
+$ umask ; touch new.txt ; mkdir newdir ; ls -ld new.txt newdir
+0022
+-rw-r--r-- 1 Nico Nico    0 Oct 12 16:10 new.txt
+drwxr-xr-x 2 Nico Nico 4096 Oct 12 16:10 newdir
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The box experiment: read-only and execute-only directory}]
+$ mkdir box ; echo hi > box/f
+$ chmod u=r,go= box  ; ls box ; cat box/f
+ls: cannot access 'box/f': Permission denied
+f
+cat: box/f: Permission denied
+$ \ls box
+f
+$ chmod u=x,go= box  ; ls box ; cat box/f
+ls: cannot open directory 'box': Permission denied
+hi
+$ chmod 755 box
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Special bits and a file of another user}]
+$ ls -l /usr/bin/passwd ; ls -ld /tmp
+-rwsr-xr-x 1 root root 84864 Jun 13 00:35 /usr/bin/passwd
+drwxrwxrwt 29 root root 920 Oct 12 16:09 /tmp
+$ cat /etc/shadow
+cat: /etc/shadow: Permission denied
+$ ls -l /etc/shadow
+-rw------- 1 root root 846 Sep 17 14:29 /etc/shadow
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{600, 644, 755 and 700.} Each digit is a sum of r = 4, w = 2, x = 1, for the
+  owner, the group and the others.
+  \begin{itemize}
+    \item \code{600} = \code{rw-------}: private files only I may read and change, such as my SSH
+    key \code{\textasciitilde/.ssh/id\_ed25519}.
+    \item \code{644} = \code{rw-r--r--}: ordinary files everyone may read but only I may change,
+    such as \code{/etc/passwd} or my notes.
+    \item \code{755} = \code{rwxr-xr-x}: programs and directories everyone may use, such as
+    \code{/usr/bin/ls} or \code{newdir}.
+    \item \code{700} = \code{rwx------}: a private directory or script, such as
+    \code{\textasciitilde/.ssh}.
+  \end{itemize}
+  \item \textbf{Why owning \code{s.txt} did not help.} The kernel decides by the permission
+  bits: because I am the owner, the \emph{owner} bits apply to me, and after \code{chmod 000}
+  they are \code{---}. Ownership only gives the right to change the permissions, which is how
+  \code{chmod u+r} made the file readable again. Only root ignores the bits.
+  \item \textbf{umask.} My umask is \code{0022}: the bits it lists are removed from every new
+  file. New files start from \code{666}, so \code{new.txt} gets \code{644} =
+  \code{rw-r--r--}; new directories start from \code{777}, so \code{newdir} gets \code{755} =
+  \code{rwxr-xr-x}. In both cases the write permission of the group and of the others was taken
+  away.
+  \item \textbf{The box experiment.} A directory is a list of names. \code{r} allows reading
+  that list: with read-only \code{box}, \code{ls} still printed the name \code{f}, but
+  \code{cat box/f} was denied. The extra error from \code{ls} comes from my alias
+  \code{ls --color=auto}, which looks inside every entry to colour it; the plain
+  \code{\textbackslash ls box} printed \code{f} without any error. \code{x} allows passing
+  through the directory to reach a file whose name is already known: with execute-only
+  \code{box}, \code{ls} could not open the directory, but \code{cat box/f} printed \code{hi}.
+  \item \textbf{\code{s} and \code{t}.} The \code{s} in \code{-rwsr-xr-x} of
+  \code{/usr/bin/passwd} is the setuid bit: the program runs with the rights of its owner, root,
+  whoever starts it. \code{passwd} needs it because passwords are stored in
+  \code{/etc/shadow}, which is \code{-rw------- root}, so a normal user cannot even read it, as
+  the failed \code{cat} shows; \code{passwd} itself makes sure that a user changes only their own
+  password. The \code{t} in \code{drwxrwxrwt} of \code{/tmp} is the sticky bit: everyone may
+  create files there, but only the owner of a file may delete or rename it.
+\end{enumerate}
+
+\section{Part 4. Disks and the kernel as files}
+
+\begin{lstlisting}[caption={Disks, partitions and the root file system}]
+$ lsblk -i
+NAME        MAJ:MIN RM   SIZE RO TYPE MOUNTPOINTS
+nvme0n1     259:0    0 953.9G  0 disk
+|-nvme0n1p1 259:1    0   100M  0 part /boot/efi
+|-nvme0n1p2 259:2    0    16M  0 part
+|-nvme0n1p3 259:3    0 247.6G  0 part
+|-nvme0n1p4 259:4    0 510.8G  0 part
+`-nvme0n1p5 259:5    0 195.3G  0 part /
+$ df -h
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p5  192G  162G   20G  89% /
+devtmpfs         16G     0   16G   0% /dev
+tmpfs            16G  6.6M   16G   1% /dev/shm
+efivarfs        128K   57K   67K  47% /sys/firmware/efi/efivars
+tmpfs           6.2G  7.3M  6.2G   1% /run
+none            1.0M     0  1.0M   0% /run/credentials/systemd-journald.service
+tmpfs            16G  4.2M   16G   1% /tmp
+/dev/nvme0n1p1   96M   86M   11M  90% /boot/efi
+tmpfs           3.1G  5.0M  3.1G   1% /run/user/1000
+$ mount | grep " / "
+/dev/nvme0n1p5 on / type ext4 (rw,relatime)
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The kernel shown as files in /proc}]
+$ grep -c processor /proc/cpuinfo
+16
+$ lscpu | grep -E "^(Core|Thread|Socket)"
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+Socket(s):                               1
+$ head -3 /proc/meminfo
+MemTotal:       32124248 kB
+MemFree:        14917128 kB
+MemAvailable:   23347136 kB
+$ head -5 /proc/self/status
+Name:	head
+Umask:	0022
+State:	R (running)
+Tgid:	448626
+Ngid:	0
+$ ls -l /proc/self/fd
+total 0
+lrwx------ 1 Nico Nico 64 Oct 12 16:10 0 -> /dev/pts/7
+lrwx------ 1 Nico Nico 64 Oct 12 16:10 1 -> /dev/pts/7
+lrwx------ 1 Nico Nico 64 Oct 12 16:10 2 -> /dev/pts/7
+lr-x------ 1 Nico Nico 64 Oct 12 16:10 3 -> /proc/448637/fd
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Drawing of my disk}]
+nvme0n1   953.9 GB NVMe SSD (block device 259:0)
+|-- nvme0n1p1    100 MB  -> /boot/efi   EFI boot partition
+|-- nvme0n1p2     16 MB     not mounted
+|-- nvme0n1p3  247.6 GB     not mounted
+|-- nvme0n1p4  510.8 GB     not mounted
+`-- nvme0n1p5  195.3 GB  -> /           ext4, 162 GB of 192 GB used (89%)
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{My disk.} The only disk is \code{nvme0n1}, a 953.9\,GB NVMe SSD, with five
+  partitions (Figure 4.3). Partition 5, \code{nvme0n1p5} (195.3\,GB), is mounted at \code{/}
+  with the ext4 file system, and partition 1 (100\,MB) is the EFI boot partition at
+  \code{/boot/efi}. Partitions 2 to 4 are not used by Linux; they belong to another operating
+  system on the same disk.
+  \item \textbf{How full the root file system is.} 162\,GB of 192\,GB are used, so it is 89\%
+  full, with 20\,GB available.
+  \item \textbf{CPU and RAM according to \code{/proc}.} \code{/proc/cpuinfo} lists 16
+  processors. These are logical CPUs: \code{lscpu} shows 8 physical cores with 2 threads each.
+  \code{/proc/meminfo} reports \code{MemTotal: 32124248 kB}, about 32\,GB (30.6\,GiB) of RAM.
+  \item \textbf{The program in \code{/proc/self/status}.} It showed \code{Name: head}, in state
+  \code{R (running)}. \code{/proc/self} always refers to the process that opens it, and the
+  process that opened \code{/proc/self/status} was \code{head} itself. In the same way,
+  \code{ls -l /proc/self/fd} showed the open files of \code{ls}: descriptors 0, 1 and 2 point to
+  my terminal \code{/dev/pts/7}, and descriptor 3 is the directory \code{/proc/448637/fd} that
+  \code{ls} had open while listing it.
+\end{enumerate}
+
+\section{Stretch (optional)}
+
+\begin{lstlisting}[caption={(b) The setuid programs on my laptop}]
+$ find / -xdev -perm -4000 -type f 2>/dev/null
+/usr/lib/electron12/chrome-sandbox
+/usr/lib/electron40/chrome-sandbox
+/usr/lib/Xorg.wrap
+/usr/lib/claude-desktop/chrome-sandbox
+/usr/lib/dbus-daemon-launch-helper
+/usr/lib/libgtop/libgtop_server2
+/usr/lib/electron39/chrome-sandbox
+/usr/lib/qemu/qemu-bridge-helper
+/usr/lib/ssh/ssh-keysign
+/usr/bin/chsh
+/usr/bin/chfn
+/usr/bin/su
+/usr/bin/pkexec
+/usr/bin/chage
+/usr/bin/sudo
+/usr/bin/gpasswd
+/usr/bin/suexec
+/usr/bin/passwd
+/usr/bin/ksu
+/usr/bin/fusermount3
+/usr/bin/expiry
+/usr/bin/mount
+/usr/bin/sg
+/usr/bin/newgrp
+/usr/bin/umount
+/usr/bin/unix_chkpwd
+/usr/bin/nvidia-modprobe
+/usr/bin/fusermount
+/opt/github-desktop/chrome-sandbox
+/opt/Discord/chrome-sandbox
+\end{lstlisting}
+
+\begin{lstlisting}[caption={(c) Deleting a file that is still open}]
+$ head -c 100M /dev/zero > bigfile
+$ df -m .
+Filesystem     1M-blocks   Used Available Use% Mounted on
+/dev/nvme0n1p5    195777 165404     20357  90% /
+$ exec 3< bigfile
+$ rm bigfile
+$ ls -l /proc/$$/fd
+total 0
+lrwx------ 1 Nico Nico 64 Oct 12 16:09 0 -> /dev/pts/7
+lrwx------ 1 Nico Nico 64 Oct 12 16:10 1 -> /dev/pts/7
+lrwx------ 1 Nico Nico 64 Oct 12 16:10 2 -> /dev/pts/7
+lrwx------ 1 Nico Nico 64 Oct 12 16:10 255 -> /dev/pts/7
+lr-x------ 1 Nico Nico 64 Oct 12 16:10 3 -> '/home/Nico/os-lab5-run/bigfile (deleted)'
+$ df -m .
+Filesystem     1M-blocks   Used Available Use% Mounted on
+/dev/nvme0n1p5    195777 165404     20357  90% /
+$ exec 3<&-
+$ df -m .
+Filesystem     1M-blocks   Used Available Use% Mounted on
+/dev/nvme0n1p5    195777 165304     20457  89% /
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}[label=(\alph*)]
+  \setcounter{enumi}{1}
+  \item \textbf{Setuid programs.} The search found 30 setuid programs. The classic ones are
+  there: \code{passwd}, \code{su}, \code{sudo}, \code{chsh}, \code{newgrp}, \code{mount} and
+  \code{umount}, which all need root rights for one specific job. My laptop also has several
+  that are not typical for a lecture slide and come from the applications I installed: the
+  \code{chrome-sandbox} helpers of Electron apps (Discord, GitHub Desktop, Claude), the
+  \code{nvidia-modprobe} helper of the NVIDIA driver and \code{qemu-bridge-helper} from QEMU.
+  \item \textbf{Deleting an open file.} \code{exec 3< bigfile} made the shell itself open the
+  100\,MB file as descriptor 3, and \code{\$\$} is the shell's own process ID. After
+  \code{rm bigfile} the link in \code{/proc/\$\$/fd} still points to the file, marked
+  \code{(deleted)}: the name is gone, but the inode is still in use. The space was \emph{not}
+  freed by \code{rm} (165\,404\,MB used before and after); it was freed only when
+  \code{exec 3<\&-} closed the descriptor, after which the used space dropped by exactly 100\,MB to
+  165\,304\,MB.
+\end{enumerate}
+
+\plainsection{Conclusions}
+
+This lab showed that a file on Linux is really two separate things: an inode, which holds the
+data, the size, the owner and the permissions, and one or more names, which are only entries in
+directories pointing to that inode. Everything I observed follows from this split. A hard link
+is just another name for the same inode, so deleting the ``original'' loses nothing, while a
+symbolic link is a separate small file that stores a path and breaks when that path disappears.
+Even directory link counts are names: the parent's entry, the directory's own \code{.} and the
+\code{..} of every subdirectory. Data is freed only when no name and no open file refers to the
+inode, which the deleted but still open file demonstrated directly.
+
+The permission experiments showed that the kernel checks the permission bits rather than mere
+ownership, that \code{r} and \code{x} mean different things on a directory, and that the umask
+decides the default permissions of new files. Special bits such as setuid and the sticky bit
+solve real problems like changing a password or sharing \code{/tmp}. Finally, \code{lsblk},
+\code{df} and \code{/proc} showed that disks, partitions, the CPU, the memory and even the
+current process are all presented to me as files, which is the core idea of Unix.
+
+\end{document}
