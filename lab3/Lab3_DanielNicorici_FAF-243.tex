@@ -1,0 +1,524 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{3}
+\newcommand{\labtitle}{The Command Line: Shell, Pipes and Text Filters}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+The purpose of this lab is to work fluently in bash: to move fast with completion and history,
+to predict what the shell does to a command line before the program runs, to send output and
+errors exactly where I want them, and to answer real questions about a data set with one line
+of small filters joined by pipes, finally turning the best one-liners into a script.
+
+The work was done on my own laptop running Arch Linux, in GNU bash 5.3.15. The data set for
+Part 4 was generated with the loop from the assignment:
+
+\begin{lstlisting}
+$ mkdir -p ~/os-lab3 && cd ~/os-lab3
+$ for i in $(seq 1 500); do
+    echo "2026-10-05 10:$(printf %02d $((i % 60))) user$((i % 7)) $([ $((i % 5)) -eq 0 ] && echo FAIL || echo OK) /page$((i % 4))"
+  done > access.log
+$ head -3 access.log ; wc -l access.log
+2026-10-05 10:01 user1 OK /page1
+2026-10-05 10:02 user2 OK /page2
+2026-10-05 10:03 user3 OK /page3
+500 access.log
+\end{lstlisting}
+
+The check prints \code{500 access.log}, so the file is correct.
+
+\section{Part 1. Move fast, find help}
+
+Pressing Tab asks bash to complete the current word. \code{/usr/sh} has only one match, so the
+first Tab completed it to \code{/usr/share/}; the next Tab only rang the bell because many
+entries start with \code{/usr/share/}, and the one after that offered to list all 229 of them.
+\code{cd /et} plus Tab completed to \code{cd /etc/} at once.
+
+\begin{lstlisting}[caption={Tab completion}]
+$ ls /usr/sh[Tab]
+$ ls /usr/share/[Tab]
+$ ls /usr/share/[Tab]
+Display all 229 possibilities? (y or n) n
+$ cd /et[Tab]
+$ cd /etc/
+$ pwd
+/etc
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Output of type and which}]
+$ type cd ; type ls ; type echo ; which ls
+cd is a shell builtin
+ls is aliased to `ls --color=auto'
+echo is a shell builtin
+/usr/bin/ls
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The directories in PATH}]
+$ echo $PATH
+/home/Nico/.local/bin:/home/Nico/.local/bin:/home/Nico/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/opt/cuda/bin:/usr/lib/jvm/default/bin:/usr/bin/site_perl:/usr/bin/vendor_perl:/usr/bin/core_perl
+$ echo $PATH | tr ':' '\n'
+/home/Nico/.local/bin
+/home/Nico/.local/bin
+/home/Nico/.bun/bin
+/usr/local/sbin
+/usr/local/bin
+/usr/bin
+/opt/cuda/bin
+/usr/lib/jvm/default/bin
+/usr/bin/site_perl
+/usr/bin/vendor_perl
+/usr/bin/core_perl
+$ echo $PATH | tr ':' '\n' | wc -l
+11
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Exit code of a missing command}]
+$ nosuchprog ; echo "exit code: $?"
+bash: nosuchprog: command not found
+exit code: 127
+\end{lstlisting}
+
+After running three commands, Ctrl+R started a reverse search through the history: the first
+letter \code{e} matched \code{date}, \code{ec} already matched \code{echo first command}, and
+Enter ran that command again.
+
+\begin{lstlisting}[caption={Reverse history search with Ctrl+R}]
+$ echo first command
+first command
+$ date
+Mon Oct  5 17:32:25 EEST 2026
+$ whoami
+Nico
+(reverse-i-search)`ech': echo first command
+first command
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Finding help without a browser}]
+$ ls --help | head -5
+Usage: ls [OPTION]... [FILE]...
+List information about the FILEs (the current directory by default).
+Sort entries alphabetically if none of -cftuvSUX nor --sort is specified.
+
+Mandatory arguments to long options are mandatory for short options too.
+$ man -k "list directory"
+dir (1)              - list directory contents
+ls (1)               - list directory contents
+vdir (1)             - list directory contents
+$ help cd | head -2
+cd: cd [-L|[-P [-e]]] [-@] [dir]
+    Change the shell working directory.
+$ man ls | grep -n '^ *-t,\? '
+161:     -t     sort by time, newest first; see --time
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Built-ins.} \code{cd} and \code{echo} are shell built-ins; \code{ls} is an
+  external program (\code{/usr/bin/ls}), which my \code{\textasciitilde/.bashrc} wraps in the alias
+  \code{ls --color=auto}. \code{cd} \emph{must} be a built-in because the current directory
+  belongs to each process: an external \code{cd} would run as a child process, change the
+  child's directory and exit, leaving the shell exactly where it was.
+  \item \textbf{PATH.} My PATH has 11 entries (Figure 1.3), but only 10 different
+  directories: \code{\textasciitilde/.local/bin} is added twice, once by \code{\textasciitilde/.zshrc} and once by
+  \code{\textasciitilde/.bashrc}. \code{ls} is found in \code{/usr/bin}.
+  \item \textbf{Missing command.} A command that is not found returns exit code 127.
+  \item \textbf{Sort by time.} \code{ls -t} sorts by modification time, newest first (line 161
+  of \code{man ls}); \code{ls -lt} shows it in long format.
+\end{enumerate}
+
+\section{Part 2. What the shell does to your line}
+
+\begin{lstlisting}[caption={Files created in the play directory}]
+$ mkdir -p ~/os-lab3/play && cd ~/os-lab3/play
+$ touch a.c b.c file1.txt file2.txt notes.txt "alfa beta.txt"
+$ ls
+ a.c  'alfa beta.txt'   b.c   file1.txt   file2.txt   notes.txt
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Globbing results}]
+$ echo *.c
+a.c b.c
+$ echo file?.txt
+file1.txt file2.txt
+$ echo [a-b]*
+a.c alfa beta.txt b.c
+$ echo *.xyz
+*.xyz
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The ls error on a name with a space, and the fix}]
+$ ls alfa beta.txt
+ls: cannot access 'alfa': No such file or directory
+ls: cannot access 'beta.txt': No such file or directory
+$ ls "alfa beta.txt"
+'alfa beta.txt'
+$ ls alfa\ beta.txt
+'alfa beta.txt'
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Single quotes, double quotes and backslash}]
+$ echo '$HOME' "$HOME" \$HOME
+$HOME /home/Nico $HOME
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Brace expansion, arithmetic and command substitution}]
+$ echo {1..5} ; echo $((7 * 6))
+1 2 3 4 5
+42
+$ echo "today is $(date +%A), I am $(whoami)"
+today is Monday, I am Nico
+$ touch log{1..3}.txt && ls log*
+log1.txt  log2.txt  log3.txt
+\end{lstlisting}
+
+\begin{table}[H]
+  \centering
+  \caption{Predictions compared with the real output}
+  \footnotesize
+  \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.26\textwidth}>{\raggedright\arraybackslash}p{0.19\textwidth}>{\raggedright\arraybackslash}p{0.19\textwidth}>{\raggedright\arraybackslash}p{0.28\textwidth}@{}}
+    \toprule
+    \textbf{Command} & \textbf{My prediction} & \textbf{Real output} & \textbf{Explanation} \\
+    \midrule
+    \code{echo *.c} & \code{a.c b.c} & \code{a.c b.c} & bash replaces the pattern with matching names \\
+    \code{echo file?.txt} & \code{file1.txt file2.txt} & \code{file1.txt file2.txt} & \code{?} matches exactly one character \\
+    \code{echo [a-b]*} & \code{a.c alfa beta.txt b.c} & \code{a.c alfa beta.txt b.c} & names starting with a or b, sorted \\
+    \code{echo *.xyz} & \code{*.xyz} & \code{*.xyz} & no match, so bash leaves the pattern unchanged \\
+    \code{ls alfa beta.txt} & two ``cannot access'' errors & two ``cannot access'' errors & the space splits the name into two arguments \\
+    \code{ls "alfa beta.txt"} & \code{\textquotesingle{}alfa beta.txt\textquotesingle{}} & \code{\textquotesingle{}alfa beta.txt\textquotesingle{}} & quotes keep it one argument \\
+    \code{echo \textquotesingle{}\$HOME\textquotesingle{} "\$HOME" \textbackslash\$HOME} & \code{\$HOME /home/Nico \$HOME} & \code{\$HOME /home/Nico \$HOME} & only double quotes allow expansion \\
+    \code{echo \{1..5\} ; echo \$((7 * 6))} & \code{1 2 3 4 5}, \code{42} & \code{1 2 3 4 5}, \code{42} & brace expansion, then arithmetic \\
+    \code{echo "today is \$(date +\%A), I am \$(whoami)"} & \code{today is Monday, I am Nico} & \code{today is Monday, I am Nico} & \code{\$(...)} is replaced by the command's output \\
+    \code{touch log\{1..3\}.txt \&\& ls log*} & \code{log1.txt log2.txt log3.txt} & \code{log1.txt log2.txt log3.txt} & braces create three names, the glob finds them \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Predictions.} Table 2.1 compares each prediction with the real output. The one
+  that is easy to get wrong is \code{echo *.xyz}: when a pattern matches nothing, bash does not
+  remove it but passes it through unchanged, so \code{echo} prints \code{*.xyz} literally.
+  \item \textbf{Who produced the file names.} The shell. Before running \code{echo}, bash
+  performs pathname expansion: it replaces \code{*.c} with the matching names in the current
+  directory, so \code{echo} only receives \code{a.c} and \code{b.c} as ordinary arguments.
+  \item \textbf{Why \code{ls alfa beta.txt} failed.} Bash splits the line into words at spaces,
+  so \code{ls} received two arguments, \code{alfa} and \code{beta.txt}, and neither file
+  exists. Two fixes: quote the name (\code{"alfa beta.txt"} or \code{\textquotesingle{}alfa beta.txt\textquotesingle{}}), or
+  escape the space with a backslash (\code{alfa\textbackslash{} beta.txt}). A glob such as
+  \code{alfa*} also works, because a glob result is never split again.
+  \item \textbf{Single vs.\ double quotes.} Single quotes make everything inside literal, so
+  \code{\textquotesingle{}\$HOME\textquotesingle{}} stays \code{\$HOME}. Double quotes keep the text as one word but still expand
+  \code{\$VAR}, \code{\$(...)} and \code{\$((...))}, so \code{"\$HOME"} becomes
+  \code{/home/Nico}. A backslash quotes only the next character.
+\end{enumerate}
+
+\code{ls} shows \code{\textquotesingle{}alfa beta.txt\textquotesingle{}} in quotes because, when its output goes to a terminal,
+GNU \code{ls} quotes names that contain spaces or special characters, so that the name can be
+copied and pasted back into the shell as one argument.
+
+\section{Part 3. Redirection, chaining and jobs}
+
+\begin{lstlisting}[caption={stdout and stderr in separate files}]
+$ cd ~/os-lab3
+$ ls /etc /nope > out.txt 2> err.txt
+$ wc -l out.txt ; cat err.txt
+176 out.txt
+ls: cannot access '/nope': No such file or directory
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Comparing the order of redirections}]
+$ ls /etc /nope > all.txt 2>&1 ; tail -2 all.txt
+xdg
+zsh
+$ ls /etc /nope > all.txt 2>&1
+$ grep -c nope all.txt
+1
+$ ls /etc /nope 2>&1 > all.txt
+ls: cannot access '/nope': No such file or directory
+$ grep -c nope all.txt
+0
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The ; \&\& || operators}]
+$ ls /nope 2> /dev/null || echo "failed with code $?"
+failed with code 2
+$ mkdir -p tmp && cd tmp && echo "I am in $(pwd)" ; cd ~/os-lab3
+I am in /home/Nico/os-lab3/tmp
+$ true && echo "&& ran: previous succeeded"
+&& ran: previous succeeded
+$ false && echo "this is skipped"
+$ false || echo "|| ran: previous failed"
+|| ran: previous failed
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Running a background job and stopping it}]
+$ sleep 100 &
+[1] 130123
+$ jobs ; kill %1 ; jobs
+[1]+  Running                    sleep 100 &
+[1]+  Running                    sleep 100 &
+$ ls /etc /nope > all.txt 2>&1
+[1]+  Terminated                 sleep 100
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Appending and input redirection}]
+$ echo first > notes.md ; echo second >> notes.md ; cat notes.md
+first
+second
+$ wc -l < access.log
+500
+$ wc -l access.log
+500 access.log
+\end{lstlisting}
+
+The second \code{jobs} in Figure 3.4 still shows \code{Running}: \code{kill} only sends the
+signal, and the process had not died yet when \code{jobs} ran a moment later. Bash reported
+\code{Terminated} just before the next prompt.
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Which file got what.} \code{err.txt} received the error message, because
+  \code{2>} redirects file descriptor 2 (standard error). \code{out.txt} received the listing
+  from standard output: 176 lines, the \code{/etc:} header plus 175 entries.
+  \item \textbf{\code{> all.txt 2>\&1} vs.\ \code{2>\&1 > all.txt}.} Redirections are applied
+  from left to right, and \code{2>\&1} means ``make stderr point where stdout points
+  \emph{now}''. In the first form stdout is already the file, so both streams go into
+  \code{all.txt} (\code{grep -c} finds the error once). In the second form stderr is copied
+  from stdout while stdout is still the terminal, and only afterwards is stdout moved to the
+  file, so the error appears on the screen and \code{all.txt} contains no error (count 0).
+  \item \textbf{\code{wc -l < access.log}.} With \code{<} the shell opens the file and hands
+  it to \code{wc} as standard input, so \code{wc} never learns a file name and prints only the
+  number. With \code{wc -l access.log}, \code{wc} opens the file itself and prints its name.
+  \item \textbf{Operators.} \code{;} runs the next command no matter what happened before.
+  \code{\&\&} runs the next command only if the previous one succeeded (exit code 0).
+  \code{||} runs the next command only if the previous one failed (non-zero exit code); here
+  \code{ls} failed with code 2.
+\end{enumerate}
+
+\section{Part 4. Answer questions with one-liners}
+
+Every answer is one command line, saved in \code{oneliners.sh} with the question as a comment
+above it. Fields in \code{access.log} are separated by single spaces: 1 = date, 2 = time,
+3 = user, 4 = result, 5 = page.
+
+\begin{lstlisting}[caption={Number of failed requests}]
+$ grep -c FAIL access.log
+100
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Different pages requested}]
+$ cut -d' ' -f5 access.log | sort -u | nl
+     1  /page0
+     2  /page1
+     3  /page2
+     4  /page3
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Requests per page}]
+$ cut -d' ' -f5 access.log | sort | uniq -c
+    125 /page0
+    125 /page1
+    125 /page2
+    125 /page3
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Users with the most failed requests}]
+$ grep FAIL access.log | cut -d' ' -f3 | sort | uniq -c | sort -k1,1nr -k2,2 | awk 'NR == 1 { max = $1 } $1 == max'
+     15 user3
+     15 user5
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Requests and failures of user3}]
+$ echo "user3: $(grep -cw user3 access.log) requests, $(grep -w user3 access.log | grep -c FAIL) failed"
+user3: 72 requests, 15 failed
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The last 3 failed requests, time and user}]
+$ grep FAIL access.log | tail -n 3 | cut -d' ' -f2,3
+10:10 user0
+10:15 user5
+10:20 user3
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Login shells in /etc/passwd}]
+$ cut -d: -f7 /etc/passwd | sort | uniq -c | sort -rn
+     24 /usr/bin/nologin
+      2 /usr/bin/bash
+      1 /usr/bin/zsh
+      1 /usr/bin/git-shell
+      1 /bin/false
+\end{lstlisting}
+
+\begin{lstlisting}[caption={ls and ls -l line counts}]
+$ echo "ls: $(ls /etc | wc -l) lines, ls -l: $(ls -l /etc | wc -l) lines, first line of ls -l: $(ls -l /etc | head -n 1)"
+ls: 175 lines, ls -l: 176 lines, first line of ls -l: total 1280
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Full run of oneliners.sh (bonus lines 6--48 omitted)}]
+$ bash oneliners.sh
+100
+     1  /page0
+     2  /page1
+     3  /page2
+     4  /page3
+    125 /page0
+    125 /page1
+    125 /page2
+    125 /page3
+     15 user3
+     15 user5
+user3: 72 requests, 15 failed
+10:10 user0
+10:15 user5
+10:20 user3
+     24 /usr/bin/nologin
+      2 /usr/bin/bash
+      1 /usr/bin/zsh
+      1 /usr/bin/git-shell
+      1 /bin/false
+ls: 175 lines, ls -l: 176 lines, first line of ls -l: total 1280
+     1  2026-10-05 10:10 user3 FAIL /page2
+     2  2026-10-05 10:20 user6 FAIL /page0
+     3  2026-10-05 10:30 user2 FAIL /page2
+     4  2026-10-05 10:40 user5 FAIL /page0
+     5  2026-10-05 10:50 user1 FAIL /page2
+[... lines 6-48 omitted ...]
+    49  2026-10-05 10:10 user0 FAIL /page2
+    50  2026-10-05 10:20 user3 FAIL /page0
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Bonus: failed requests at minutes ending in 0}]
+$ grep -E '^[^ ]+ [0-9]{2}:[0-9]0 [^ ]+ FAIL ' access.log | nl | tail -n 2
+    49  2026-10-05 10:10 user0 FAIL /page2
+    50  2026-10-05 10:20 user3 FAIL /page0
+\end{lstlisting}
+
+\textbf{Answers:}
+\begin{enumerate}[label=Q\arabic*.]
+  \item 100 requests failed.
+  \item 4 different pages: \code{/page0}, \code{/page1}, \code{/page2}, \code{/page3}.
+  \code{sort -u} keeps one copy of each and \code{nl} numbers them, so the last number is the
+  count.
+  \item Each page got 125 requests; \(4 \times 125 = 500\), the number of lines in the log.
+  \item There is a tie: \code{user3} and \code{user5} have 15 failed requests each. The final
+  \code{awk} keeps every line whose count equals the first (largest) one, so a tie is shown
+  instead of silently picking one user.
+  \item \code{user3} made 72 requests, 15 of which failed. \code{-w} matches \code{user3} only
+  as a whole word.
+  \item The last three failures are at 10:10 (\code{user0}), 10:15 (\code{user5}) and 10:20
+  (\code{user3}).
+  \item Five login shells appear: \code{/usr/bin/nologin} (24 accounts, system users that may
+  not log in), \code{/usr/bin/bash} (2), \code{/usr/bin/zsh} (1, my account),
+  \code{/usr/bin/git-shell} (1) and \code{/bin/false} (1).
+  \item My prediction was that \code{ls -l} adds one extra line, and it does: 175 vs.\ 176.
+  When the output is a pipe, \code{ls} prints one name per line, while \code{ls -l} prints one
+  line per entry \emph{plus} the header \code{total 1280}, the disk space used by the listed
+  files in 1\,KiB blocks.
+\end{enumerate}
+
+\textbf{Bonus:} 50 lines match. The pattern \code{[0-9]\{2\}:[0-9]0} accepts any time whose
+minute ends in 0, and \code{FAIL} must follow the user field. A minute ends in 0 when
+\(i\) is a multiple of 10, and a request fails when \(i\) is a multiple of 5, so both hold for
+the 50 multiples of 10 up to 500.
+
+\textbf{Self-check:} the Q3 counts add up to 500, and the per-user failure counts behind Q4
+(14 for \code{user0}, \code{user1}, \code{user2}, \code{user4}, \code{user6} and 15 for
+\code{user3}, \code{user5}) add up to \(5 \times 14 + 2 \times 15 = 100\), the answer to Q1.
+The file runs with \code{bash oneliners.sh} inside \code{\textasciitilde/os-lab3}.
+
+\section{Part 5. Your first script}
+
+The TODO is completed with a loop over \code{user0}--\code{user6}: brace expansion produces
+the numbers 0 to 6, and for each user \code{grep -w} selects that user's lines and
+\code{grep -c FAIL} counts the failures.
+
+\begin{lstlisting}[caption={Contents of report.sh}]
+#!/bin/bash
+# usage: ./report.sh access.log
+log=$1
+if [ ! -f "$log" ]; then
+	echo "no such file: $log" >&2
+	exit 1
+fi
+total=$(wc -l < "$log")
+fails=$(grep -c FAIL "$log")
+echo "$total requests, $fails failed"
+for n in {0..6}; do
+	echo "user$n: $(grep -w "user$n" "$log" | grep -c FAIL) failures"
+done
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Running the script on access.log}]
+$ chmod +x report.sh
+$ ./report.sh access.log
+500 requests, 100 failed
+user0: 14 failures
+user1: 14 failures
+user2: 14 failures
+user3: 15 failures
+user4: 14 failures
+user5: 15 failures
+user6: 14 failures
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Error handling for a missing file}]
+$ ./report.sh nope.log ; echo "exit code: $?"
+no such file: nope.log
+exit code: 1
+$ ./report.sh nope.log 2> /dev/null ; echo "exit code: $?"
+exit code: 1
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Running the script before chmod +x and without ./}]
+$ ./report.sh access.log ; echo "exit code: $?"
+bash: ./report.sh: Permission denied
+exit code: 126
+$ report.sh access.log
+bash: report.sh: command not found
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{The \code{\#!/bin/bash} line.} It is the ``shebang'': when the kernel is asked
+  to execute the file, it sees \code{\#!} and runs \code{/bin/bash} with the script as its
+  argument, so the line chooses the interpreter. Before \code{chmod +x} the file has no execute
+  permission, so the kernel refuses to run it: \code{Permission denied}, exit code 126
+  (Figure 5.4). It could still be run as \code{bash report.sh}.
+  \item \textbf{Why \code{./report.sh}.} A command name without a slash is searched only in the
+  PATH directories, and the current directory is not in PATH (Figure 1.3), so
+  \code{report.sh} alone gives \code{command not found}. \code{./} is an explicit path to the
+  file in the current directory.
+  \item \textbf{\code{>\&2} and \code{exit 1}.} The error goes to standard error so that it
+  never mixes with the real output: if the report is piped or saved to a file, the error still
+  reaches the screen, and it can be discarded separately with \code{2> /dev/null}
+  (Figure 5.3). \code{exit 1} returns a non-zero exit code, which tells the caller
+  (\code{\&\&}, \code{||}, another script) that the script failed even when the message is
+  hidden.
+\end{enumerate}
+
+\plainsection{Conclusions}
+
+This lab showed how much the shell does before a program even starts. Bash splits the line into
+words, expands globs, variables, braces, arithmetic and command substitutions, removes the
+quotes, and sets up redirections, so the program only receives a ready list of arguments and
+already-open file descriptors. Predicting each line before running it made these steps
+visible, especially the cases that surprise, such as an unmatched glob that stays literal or a
+space that splits one file name into two arguments.
+
+Redirection is just rewiring file descriptors from left to right, which is why the order of
+\code{>} and \code{2>\&1} matters, and exit codes are what \code{\&\&} and \code{||} decide on.
+With these pieces, questions about 500 lines of log data were answered by short pipelines of
+\code{grep}, \code{cut}, \code{sort}, \code{uniq} and \code{wc}, each tool doing one small
+job. The same pipelines became a reusable script once it had a shebang, execute permission,
+error messages on standard error and a meaningful exit code.
+
+\end{document}
