@@ -1,0 +1,208 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{8}
+\newcommand{\labtitle}{The Same Calls, Inside Your Own OS}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+In Lab 7 I ran \code{fork}, \code{exec} and \code{wait} on Linux. The purpose of this lab is to
+run the same program inside xv6, the small operating system built during this semester, and to
+see that the calls are the same; and then to make two processes talk to each other through pipes
+with a program called \code{pingpong}.
+
+The work was done in my \code{\textasciitilde/xv6-riscv} tree (\code{mit-pdos/xv6-riscv}, commit
+\code{06aad25}), cross-compiled with \code{riscv64-linux-gnu-gcc} 16.2.1 and run on QEMU 11.1.1.
+Every new program is a file \code{user/NAME.c} plus one line \code{\$U/\_NAME\textbackslash} in
+\code{UPROGS}, and every run started from a fresh disk image.
+
+\section{Part 1. run, inside xv6}
+
+The program performs the same three steps as \code{run.c} in Lab 7, but there is no glibc in
+xv6, only the system calls of the kernel I compiled. The child becomes \code{echo}.
+
+\begin{lstlisting}[style=ccode,caption={user/run.c}]
+#include "kernel/types.h"
+#include "user/user.h"
+
+// the three steps of the shell, inside xv6:  echo hello from the child
+int
+main(int argc, char *argv[])
+{
+  printf("parent: my pid is %d\n", getpid());
+
+  int pid = fork();                     // step 1: copy myself
+  if(pid < 0){
+    printf("fork failed\n");
+    exit(1);
+  }
+
+  if(pid == 0){                         // only the child runs this
+    printf("child: my pid is %d\n", getpid());
+    char *args[] = { "echo", "hello", "from", "the", "child", 0 };
+    exec("echo", args);                 // step 2: become echo
+    printf("exec failed\n");            // runs only if exec failed
+    exit(1);
+  }
+
+  int status;
+  wait(&status);                        // step 3: wait for the child
+  printf("parent: child %d ended with status %d\n", pid, status);
+  exit(0);
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The UPROGS lines for run and pingpong}]
+$ grep -n "_run\|_pingpong" Makefile
+157:	$U/_run\
+158:	$U/_pingpong\
+\end{lstlisting}
+
+\begin{lstlisting}[caption={run in xv6: the child becomes echo}]
+$ make qemu
+...
+init: starting sh
+$ run
+parent: my pid is 3
+child: my pid is 4
+hello from the child
+parent: child 4 ended with status 0
+\end{lstlisting}
+
+Then the child was made to run \code{ls} by changing two lines:
+
+\begin{lstlisting}[style=ccode,firstnumber=18,caption={The change that makes the child run ls}]
+    char *args[] = { "ls", 0 };
+    exec("ls", args);                 // step 2: become ls
+\end{lstlisting}
+
+\begin{lstlisting}[caption={run in xv6: the child becomes ls}]
+$ run
+parent: my pid is 3
+child: my pid is 4
+.              1 1 1024
+..             1 1 1024
+README         2 2 2441
+[... 24 entries omitted ...]
+run            2 27 35064
+pingpong       2 28 35056
+console        3 29 0
+parent: child 4 ended with status 0
+\end{lstlisting}
+
+Finally the exec line was changed to \code{exec("nosuchprog", args);}, a program that does not
+exist:
+
+\begin{lstlisting}[caption={run in xv6: exec of a missing program}]
+$ run
+parent: my pid is 3
+child: my pid is 4
+exec failed
+parent: child 4 ended with status 1
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{The three calls on xv6 and on Linux.} In xv6, \code{run.c} uses \code{fork()},
+  \code{exec()} and \code{wait()}; on Linux it used \code{fork()}, \code{execlp()} and
+  \code{waitpid()}. The three steps and their meaning are the same: \code{fork} copies the
+  process and returns 0 in the child and the child's PID in the parent; \code{exec} replaces the
+  program of the calling process and returns only if it fails; \code{wait} blocks until the child
+  ends and gives back its exit status. Only the details differ: xv6's \code{exec} takes the path
+  and an argument array and does not search a PATH, its \code{wait} takes only the address of the
+  status, and the status is the plain exit code, without a \code{WEXITSTATUS} macro.
+  \item \textbf{Who prints ``hello from the child''.} \code{echo} prints it. After a successful
+  \code{exec} the child no longer runs the code of \code{run}: its memory now holds the
+  \code{echo} program, which prints its arguments. That is also why \code{exec failed} is not
+  printed in that case.
+  \item \textbf{Status 1 here and 127 on Linux.} The status is simply the number the child passes
+  to \code{exit}, and the two programs chose different numbers: after a failed exec, the xv6
+  \code{run.c} calls \code{exit(1)}, while the Linux \code{run.c} calls \code{exit(127)}, the
+  number shells use for ``command not found''.
+\end{enumerate}
+
+\section{Part 2. pingpong}
+
+The parent sends one byte to the child through a first pipe. The child prints that it received
+the ping, writes the byte back through a second pipe and exits; the parent reads it, prints that
+it received the pong and waits for the child. Each process first closes the two pipe ends it
+does not use.
+
+\begin{lstlisting}[style=ccode,caption={user/pingpong.c}]
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  int p2c[2], c2p[2];     // parent-to-child, child-to-parent
+  char b;
+
+  pipe(p2c);
+  pipe(c2p);
+
+  if(fork() == 0){
+    close(p2c[1]); close(c2p[0]);       // the ends the child does not use
+    read(p2c[0], &b, 1);
+    printf("%d: received ping\n", getpid());
+    write(c2p[1], &b, 1);
+    exit(0);
+  }
+
+  close(p2c[0]); close(c2p[1]);         // the ends the parent does not use
+  b = 'x';
+  write(p2c[1], &b, 1);
+  read(c2p[0], &b, 1);
+  printf("%d: received pong\n", getpid());
+  wait(0);
+  exit(0);
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={pingpong in xv6}]
+$ pingpong
+6: received ping
+5: received pong
+\end{lstlisting}
+
+The child (PID 6) prints ``received ping'' first, then the parent (PID 5) prints ``received
+pong''. PIDs 3 and 4 had been used by \code{run} in the same session.
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Why two pipes.} A pipe carries data in one direction only: bytes written into
+  its write end come out of its read end. If both directions used the same pipe, the parent could
+  read back its own ``ping'' byte before the child reads it, and nothing would tell the two
+  processes whose byte they are reading. With one pipe for each direction, every byte has exactly
+  one sender and one receiver.
+  \item \textbf{What makes the parent wait.} The \code{read} call. \code{read(c2p[0], \&b, 1)}
+  blocks until there is a byte in the pipe, so the parent sleeps until the child writes the pong.
+  In the same way the child's \code{read(p2c[0], \&b, 1)} blocks until the parent's ping
+  arrives, which is why ``received ping'' is always printed first.
+\end{enumerate}
+
+The optional \code{primes.c} was not done.
+
+\plainsection{Conclusions}
+
+Running the same program on Linux and inside xv6 showed that the process interface is the same
+idea in both systems: a process is created with \code{fork}, turned into another program with
+\code{exec}, and collected with \code{wait}, which returns the number the child passed to
+\code{exit}. The differences are only in the library around the calls, such as \code{execlp}
+searching the PATH on Linux or the \code{WEXITSTATUS} macro, while the kernel calls underneath do
+the same work.
+
+The \code{pingpong} program showed how processes communicate. A pipe is a one-way channel inside
+the kernel, so a conversation in both directions needs two pipes, and every process should close
+the ends it does not use. No explicit synchronisation was needed: because \code{read} blocks
+until data arrives, the order of the messages follows automatically from the pipes themselves.
+
+\end{document}
