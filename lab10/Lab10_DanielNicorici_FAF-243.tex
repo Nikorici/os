@@ -1,0 +1,241 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{10}
+\newcommand{\labtitle}{Add Your Own System Call: trace}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+In this lab the kernel itself is changed for the first time. The purpose is to add a new system
+call to xv6, \code{trace}, which makes a process print every system call it makes, the same
+thing \code{strace} did on Linux in Lab 9, and to follow one number, 23, from a user program
+down to a function in the kernel.
+
+The work was done in my \code{\textasciitilde/xv6-riscv} tree (\code{mit-pdos/xv6-riscv}, commit
+\code{06aad25}), cross-compiled with \code{riscv64-linux-gnu-gcc} 16.2.1 and run on QEMU 11.1.1.
+In this tree number 22 is already \code{sync} and the kernel prints with \code{printk}, so the
+new call uses 23 and \code{printk}.
+
+\section{Part 1. The number and the user side}
+
+Five small edits give the call a number and teach the user side to ask for it.
+
+\begin{lstlisting}[caption={The number, the declaration, the stub and the UPROGS line}]
+$ git diff kernel/syscall.h user/user.h user/usys.pl
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,4 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_trace  23
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,7 @@ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+ int sync(void);
++int trace(int);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,4 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("trace");
+$ grep -n "_trace" Makefile
+149:	$U/_trace\
+\end{lstlisting}
+
+At build time \code{usys.pl} writes \code{user/usys.S}, where \code{trace} becomes three
+instructions: \code{li a7, SYS\_trace}, \code{ecall}, \code{ret}.
+
+\begin{lstlisting}[style=ccode,caption={user/trace.c}]
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  if (argc < 3) {
+    fprintf(2, "usage: trace mask command [args...]\n");
+    exit(1);
+  }
+  if (trace(atoi(argv[1])) < 0) {
+    fprintf(2, "trace: failed\n");
+    exit(1);
+  }
+  exec(argv[2], argv + 2);
+  fprintf(2, "trace: exec %s failed\n", argv[2]);
+  exit(1);
+}
+\end{lstlisting}
+
+The program sets the mask on itself and then becomes the command with \code{exec}; the mask
+stays, because \code{exec} keeps the same process.
+
+\begin{lstlisting}[caption={Check 1: the number reaches the kernel}]
+$ trace 32 grep hello README
+3 trace: unknown sys call 23
+trace: failed
+\end{lstlisting}
+
+The kernel has no function for 23 yet, so it complains, but the message proves that the program
+ran \code{ecall} with \code{a7 = 23} and that the kernel received it.
+
+\section{Part 2. The kernel side}
+
+\begin{lstlisting}[style=ccode,firstnumber=103,caption={kernel/proc.h: a place for the mask in struct proc}]
+  char name[16];               // Process name (debugging)
+  int trace_mask;
+\end{lstlisting}
+
+\begin{lstlisting}[style=ccode,firstnumber=114,caption={kernel/sysproc.c: the handler}]
+uint64
+sys_trace(void)
+{
+  int mask;
+  argint(0, &mask);
+  myproc()->trace_mask = mask;
+  return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[style=ccode,caption={kernel/syscall.c: the table entry, the names and the print}]
+extern uint64 sys_sync(void);
+extern uint64 sys_trace(void);
+...
+  [SYS_sync]    = sys_sync,
+  [SYS_trace]   = sys_trace,
+...
+static char *syscallnames[] = {
+  [SYS_fork] "fork",   [SYS_exit] "exit",     [SYS_wait] "wait",
+  [SYS_pipe] "pipe",   [SYS_read] "read",     [SYS_kill] "kill",
+  [SYS_exec] "exec",   [SYS_fstat] "fstat",   [SYS_chdir] "chdir",
+  [SYS_dup] "dup",     [SYS_getpid] "getpid", [SYS_sbrk] "sbrk",
+  [SYS_pause] "pause", [SYS_uptime] "uptime", [SYS_open] "open",
+  [SYS_write] "write", [SYS_mknod] "mknod",   [SYS_unlink] "unlink",
+  [SYS_link] "link",   [SYS_mkdir] "mkdir",   [SYS_close] "close",
+  [SYS_sync] "sync",   [SYS_trace] "trace",
+};
+...
+    p->trapframe->a0 = syscalls[num]();
+    if ((p->trace_mask >> num) & 1)
+      printk("%d: syscall %s -> %ld\n",
+             p->pid, syscallnames[num], p->trapframe->a0);
+\end{lstlisting}
+
+\begin{lstlisting}[style=ccode,firstnumber=290,caption={kernel/proc.c: children inherit the mask in fork()}]
+  safestrcpy(np->name, p->name, sizeof(p->name));
+  np->trace_mask = p->trace_mask;
+\end{lstlisting}
+
+The handler reads argument 0 (register \code{a0}) with \code{argint} and stores it on the
+current process. The print is placed after the call, so the return value is already in
+\code{a0} of the trapframe.
+
+\begin{lstlisting}[caption={Check 2: trace works}]
+$ trace 32 grep hello README
+3: syscall read -> 1023
+3: syscall read -> 965
+3: syscall read -> 453
+3: syscall read -> 0
+\end{lstlisting}
+
+The numbers are exactly the expected ones: \(1023 + 965 + 453 = 2441\), the size of
+\code{README}, read in three pieces, then 0 for the end of the file.
+
+\section{Part 3. Play with the mask}
+
+The mask is a number read in binary: bit \(N\) on means ``print call number \(N\)''.
+
+\begin{lstlisting}[caption={All the calls (all bits on)}]
+$ trace 2147483647 grep hello README
+4: syscall trace -> 0
+4: syscall exec -> 3
+4: syscall open -> 3
+4: syscall read -> 1023
+4: syscall read -> 965
+4: syscall read -> 453
+4: syscall read -> 0
+4: syscall close -> 0
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Only fork (mask 2), on a test that fills the process table}]
+$ trace 2 usertests forkforkfork
+usertests starting
+test forkforkfork: 4: syscall fork -> 5
+5: syscall fork -> 6
+6: syscall fork -> 7
+6: syscall fork -> 8
+6: syscall fork -> 9
+6: syscall fork -> 10
+[... 55 more fork lines from pids 6, 7 and 8 ...]
+7: syscall fork -> -1
+6: syscall fork -> -1
+8: syscall fork -> -1
+OK
+ALL TESTS PASSED
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Only write (mask 65536)}]
+$ trace 65536 echo hi
+hi5: syscall write -> 2
+
+5: syscall write -> 1
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Only open and close (mask 2129920)}]
+$ trace 2129920 grep hello README
+3: syscall open -> 3
+3: syscall close -> 0
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Why only \code{read} with mask 32.} \(32 = 2^5\) has only bit 5 on, and 5 is
+  \code{SYS\_read}. \code{open} is call 15 and \code{close} is call 21; their bits are 0, so the
+  test \code{(p->trace\_mask >> num) \& 1} is false for them and nothing is printed.
+  \item \textbf{Why several pids print in \code{forkforkfork}.} Because children inherit the
+  mask: the line \code{np->trace\_mask = p->trace\_mask;} in \code{fork()} copies it from the
+  parent to the child. In my run pids 4 and 5 printed one line each and pids 6, 7 and 8 printed
+  the rest, until \code{fork} returned \(-1\) when the process table was full.
+  \item \textbf{Why the trace line is between ``hi'' and the new line.} \code{echo} calls
+  \code{write} twice: once for the word \code{hi} (return value 2) and once for the newline
+  (return value 1). The kernel prints the trace line right after each call returns, so the first
+  trace line comes after \code{hi} and before the newline of the second \code{write}.
+  \item \textbf{The mask for \code{open} and \code{close} only.} \code{open} is 15 and
+  \code{close} is 21, so the mask is \(2^{15} + 2^{21} = 32768 + 2097152 = 2129920\). Figure 3.4
+  confirms it: only \code{open -> 3} and \code{close -> 0} are printed.
+\end{enumerate}
+
+The optional \code{sysinfo} call was not done.
+
+\plainsection{Conclusions}
+
+Adding \code{trace} showed the whole path of a system call, because every station on that path
+had to be edited by hand. The call needs a number in \code{kernel/syscall.h}, a declaration in
+\code{user/user.h} and a stub in \code{usys.pl} that puts the number in register \code{a7} and
+executes \code{ecall}. On the kernel side the number is only an index into the table of
+\code{syscall.c}, and the handler reads its argument from the saved registers of the process.
+The first check made this concrete: with only the user side in place, the kernel already
+received 23 and answered that it did not know it.
+
+The mask also showed where per-process state lives: in \code{struct proc}. It survives
+\code{exec}, because \code{exec} changes the program and not the process, and it reaches the
+children only because \code{fork} copies it explicitly. With about thirty lines of code, xv6
+now has a small \code{strace} of its own.
+
+\end{document}

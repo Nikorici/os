@@ -1,0 +1,18 @@
+Lab 10 - Add Your Own System Call: trace (xv6)
+Daniel Nicorici, FAF-243. Full report with outputs: Lab10_DanielNicorici_FAF-243.pdf
+
+1. In "trace 32 grep hello README" only read is printed because the mask 32 = 2^5 has only
+   bit 5 on, and 5 is SYS_read. open is call 15 and close is call 21; their bits are 0, so
+   the test (p->trace_mask >> num) & 1 is false for them.
+
+2. Three pids print because children inherit the mask: the line
+   np->trace_mask = p->trace_mask; in fork() (kernel/proc.c) copies it from parent to child.
+
+3. echo calls write twice: once for the word "hi" and once for the newline. The kernel prints
+   the trace line right after each call returns, so the first trace line lands after "hi" and
+   before the newline that the second write prints.
+
+4. open is 15 and close is 21: 2^15 + 2^21 = 32768 + 2097152 = 2129920.
+   "trace 2129920 grep hello README" prints only "open -> 3" and "close -> 0".
+
+Optional sysinfo was not done.
