@@ -1,0 +1,428 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{11}
+\newcommand{\labtitle}{The Race and the Semaphore}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+Two threads that touch the same variable at the same time lose work. The purpose of this lab is
+to see that happen, to fix it with a mutex and with a semaphore, and then to use the same
+semaphore in three ways: as a lock, as a signal and as a counter.
+
+The work was done on my Arch Linux laptop with gcc 16.2.1, in the folder
+\code{\textasciitilde/os-lab11}. All programs were compiled with \code{-pthread} and without
+\code{-O2}, because the optimizer would hide the race of Part 1.
+
+\section{Part 1. See the race}
+
+Two threads each add 1 to the same counter, one million times. The right answer is 2\,000\,000.
+
+\begin{lstlisting}[style=ccode,caption={race.c}]
+#include <stdio.h>
+#include <pthread.h>
+
+#define N 1000000
+
+long counter = 0;
+
+void *add(void *arg) {
+    for (int i = 0; i < N; i++)
+        counter++;
+    return NULL;
+}
+
+int main(void) {
+    pthread_t a, b;
+    pthread_create(&a, NULL, add, NULL);
+    pthread_create(&b, NULL, add, NULL);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    printf("counter = %ld (expected %d)\n", counter, 2 * N);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Three runs of race}]
+$ gcc -Wall -pthread -o race race.c
+$ ./race
+counter = 1100695 (expected 2000000)
+$ ./race
+counter = 1022820 (expected 2000000)
+$ ./race
+counter = 1076745 (expected 2000000)
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{The three steps of \code{counter++}.} The CPU loads the value of \code{counter}
+  from memory into a register, adds 1 in the register, and stores the register back to memory.
+  \item \textbf{How an addition is lost.} Both threads load the same value, for example 5. Each
+  adds 1 in its own register and each stores 6. Two additions were done, but the counter grew
+  only by one, so one of them is lost.
+  \item \textbf{Why the result differs.} The moments at which the scheduler and the two CPU
+  cores interleave the threads are different at every run, so a different number of additions
+  collide each time. Almost half of the additions were lost in every run.
+\end{enumerate}
+
+\section{Part 2. Fix it: mutex, then semaphore}
+
+\subsection{A mutex around counter++}
+
+The line between lock and unlock is the critical section: only one thread may be inside.
+
+\begin{lstlisting}[style=ccode,caption={mutex.c}]
+#include <stdio.h>
+#include <pthread.h>
+
+#define N 1000000
+
+long counter = 0;
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+void *add(void *arg) {
+    for (int i = 0; i < N; i++) {
+        pthread_mutex_lock(&lock);
+        counter++;
+        pthread_mutex_unlock(&lock);
+    }
+    return NULL;
+}
+
+int main(void) {
+    pthread_t a, b;
+    pthread_create(&a, NULL, add, NULL);
+    pthread_create(&b, NULL, add, NULL);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    printf("counter = %ld (expected %d)\n", counter, 2 * N);
+    return 0;
+}
+\end{lstlisting}
+
+\subsection{The same lock, made from a semaphore}
+
+A semaphore is a number that never goes below 0. \code{sem\_wait} takes one unit, and waits if
+there is none; \code{sem\_post} gives one back. Started at 1, it behaves like a mutex.
+
+\begin{lstlisting}[style=ccode,caption={sem.c}]
+#include <stdio.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+#define N 1000000
+
+long counter = 0;
+sem_t s;
+
+void *add(void *arg) {
+    for (int i = 0; i < N; i++) {
+        sem_wait(&s);
+        counter++;
+        sem_post(&s);
+    }
+    return NULL;
+}
+
+int main(void) {
+    sem_init(&s, 0, 1);
+    pthread_t a, b;
+    pthread_create(&a, NULL, add, NULL);
+    pthread_create(&b, NULL, add, NULL);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    printf("counter = %ld (expected %d)\n", counter, 2 * N);
+    sem_destroy(&s);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={mutex and sem, three runs each}]
+$ gcc -Wall -pthread -o mutex mutex.c
+$ ./mutex
+counter = 2000000 (expected 2000000)
+$ ./mutex
+counter = 2000000 (expected 2000000)
+$ ./mutex
+counter = 2000000 (expected 2000000)
+$ gcc -Wall -pthread -o sem sem.c
+$ ./sem
+counter = 2000000 (expected 2000000)
+$ ./sem
+counter = 2000000 (expected 2000000)
+$ ./sem
+counter = 2000000 (expected 2000000)
+\end{lstlisting}
+
+\subsection{The price of the lock}
+
+\begin{lstlisting}[caption={Timing the three versions}]
+$ time ./race
+counter = 1074869 (expected 2000000)
+
+real	0m0.004s
+user	0m0.006s
+sys	0m0.001s
+$ time ./mutex
+counter = 2000000 (expected 2000000)
+
+real	0m0.032s
+user	0m0.036s
+sys	0m0.027s
+$ time ./sem
+counter = 2000000 (expected 2000000)
+
+real	0m0.051s
+user	0m0.069s
+sys	0m0.033s
+\end{lstlisting}
+
+\begin{lstlisting}[caption={sem.c with sem\_init(\&s, 0, 2), three runs}]
+$ gcc -Wall -pthread -o sem sem.c && ./sem && ./sem && ./sem
+counter = 1978631 (expected 2000000)
+counter = 1988948 (expected 2000000)
+counter = 1982592 (expected 2000000)
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Always 2\,000\,000?} Yes. \code{mutex} and \code{sem} gave exactly 2\,000\,000
+  in all three runs each.
+  \item \textbf{A start value of 2.} The semaphore then lets two threads into the critical
+  section at once, and the program has only two threads, so nobody ever waits and the race is
+  back: 1\,978\,631, 1\,988\,948 and 1\,982\,592. Fewer additions are lost than in
+  \code{race}, only because the extra calls make the collisions rarer. After the test the value
+  was put back to 1.
+  \item \textbf{Why the locked version is slower.} Every addition now also pays for one lock
+  and one unlock operation, and a thread that finds the lock taken must wait, sometimes by
+  entering the kernel (the \code{sys} time grew from 0.001 s to about 0.03 s). The order is the
+  same as on the reference machine: \code{race} 0.004 s and wrong, \code{mutex} 0.032 s,
+  \code{sem} 0.051 s.
+\end{enumerate}
+
+\section{Part 3. A semaphore as a signal}
+
+Here the problem is the order: B must read the message only after A has written it. A semaphore
+that starts at 0 is a closed door: B waits at \code{sem\_wait} until A calls \code{sem\_post}.
+
+\begin{lstlisting}[style=ccode,caption={order.c}]
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+char message[32];
+sem_t ready;
+
+void *writer(void *arg) {
+    sleep(1);
+    strcpy(message, "hello");
+    printf("A: message written\n");
+    sem_post(&ready);
+    return NULL;
+}
+
+void *reader(void *arg) {
+    printf("B: waiting for the message...\n");
+    sem_wait(&ready);
+    printf("B: I read \"%s\"\n", message);
+    return NULL;
+}
+
+int main(void) {
+    sem_init(&ready, 0, 0);
+    pthread_t a, b;
+    pthread_create(&b, NULL, reader, NULL);
+    pthread_create(&a, NULL, writer, NULL);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    sem_destroy(&ready);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={order with the semaphore starting at 0}]
+$ gcc -Wall -pthread -o order order.c
+$ ./order
+B: waiting for the message...
+A: message written
+B: I read "hello"
+\end{lstlisting}
+
+B printed its first line at once, nothing happened for one second, then A and B finished.
+
+\begin{lstlisting}[caption={order with sem\_init(\&ready, 0, 1)}]
+$ gcc -Wall -pthread -o order order.c && ./order
+B: waiting for the message...
+B: I read ""
+A: message written
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Start value 1.} B reads an empty message, \code{B: I read ""}. The semaphore
+  already holds one unit, so \code{sem\_wait} passes at once and B reads \code{message} before
+  A, which is still sleeping, has written it. The door was open from the start.
+  \item \textbf{A semaphore that starts at 0} means ``the event has not happened yet'': whoever
+  waits on it is blocked until another thread posts.
+\end{enumerate}
+
+\section{Part 4. A semaphore as a counter: the parking lot}
+
+Six cars, three places. The semaphore starts at 3 and counts the free places. The mutex is there
+only so that the variable \code{inside} and the \code{printf} stay together.
+
+\begin{lstlisting}[style=ccode,caption={parking.c}]
+#include <stdio.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <semaphore.h>
+
+#define PLACES 3
+#define CARS 6
+
+sem_t places;
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+int inside = 0;
+
+void *car(void *arg) {
+    long id = (long)arg;
+    sem_wait(&places);
+    pthread_mutex_lock(&lock);
+    inside++;
+    printf("car %ld enters (inside: %d)\n", id, inside);
+    pthread_mutex_unlock(&lock);
+    sleep(1);
+    pthread_mutex_lock(&lock);
+    inside--;
+    printf("car %ld leaves (inside: %d)\n", id, inside);
+    pthread_mutex_unlock(&lock);
+    sem_post(&places);
+    return NULL;
+}
+
+int main(void) {
+    sem_init(&places, 0, PLACES);
+    pthread_t t[CARS];
+    for (long i = 0; i < CARS; i++)
+        pthread_create(&t[i], NULL, car, (void *)(i + 1));
+    for (int i = 0; i < CARS; i++)
+        pthread_join(t[i], NULL);
+    sem_destroy(&places);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={parking with 3 places}]
+$ gcc -Wall -pthread -o parking parking.c
+$ ./parking
+car 2 enters (inside: 1)
+car 3 enters (inside: 2)
+car 1 enters (inside: 3)
+car 2 leaves (inside: 2)
+car 3 leaves (inside: 1)
+car 1 leaves (inside: 0)
+car 4 enters (inside: 1)
+car 5 enters (inside: 2)
+car 6 enters (inside: 3)
+car 4 leaves (inside: 2)
+car 6 leaves (inside: 1)
+car 5 leaves (inside: 0)
+\end{lstlisting}
+
+\begin{lstlisting}[caption={parking with PLACES set to 1}]
+$ gcc -Wall -pthread -o parking parking.c && ./parking
+car 2 enters (inside: 1)
+car 2 leaves (inside: 0)
+car 1 enters (inside: 1)
+car 1 leaves (inside: 0)
+car 3 enters (inside: 1)
+car 3 leaves (inside: 0)
+car 4 enters (inside: 1)
+car 4 leaves (inside: 0)
+car 5 enters (inside: 1)
+car 5 leaves (inside: 0)
+car 6 enters (inside: 1)
+car 6 leaves (inside: 0)
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{The largest value of \code{inside}.} It is 3 and never more. The line that
+  guarantees it is \code{sem\_wait(\&places);} together with the start value in
+  \code{sem\_init(\&places, 0, PLACES)}: after three cars have taken a unit the value is 0, and
+  the fourth car blocks until a car leaves and calls \code{sem\_post}.
+  \item \textbf{PLACES set to 1.} The semaphore becomes a mutex (a binary semaphore): only one
+  car is inside at a time, each car enters and leaves before the next one, and the run takes
+  six seconds instead of two.
+\end{enumerate}
+
+\section{Optional: no lock at all}
+
+For a single counter there is a third way: an atomic operation. \code{atomic\_fetch\_add} does
+the load, the add and the store as one indivisible step of the CPU.
+
+\begin{lstlisting}[style=ccode,caption={atomic.c}]
+#include <stdio.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+#define N 1000000
+
+atomic_long counter = 0;
+
+void *add(void *arg) {
+    for (int i = 0; i < N; i++)
+        atomic_fetch_add(&counter, 1);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t a, b;
+    pthread_create(&a, NULL, add, NULL);
+    pthread_create(&b, NULL, add, NULL);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    printf("counter = %ld (expected %d)\n", (long)counter, 2 * N);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={atomic: correct and faster than the mutex}]
+$ gcc -Wall -pthread -o atomic atomic.c
+$ time ./atomic
+counter = 2000000 (expected 2000000)
+
+real	0m0.016s
+user	0m0.029s
+sys	0m0.001s
+\end{lstlisting}
+
+The answer is correct with no lock, in 0.016 s, half the time of the mutex version, and the
+program never enters the kernel to wait.
+
+\plainsection{Conclusions}
+
+The lab showed a race condition with my own eyes: \code{counter++} is three machine steps, and
+two threads that interleave those steps lose almost half of their additions, differently at
+every run. The fix is to make the three steps a critical section that only one thread can
+execute at a time, with a mutex or with a semaphore that starts at 1. The result becomes
+correct, at the price of time, because every addition also pays for locking.
+
+The same semaphore then did three different jobs, depending only on its start value. Started at
+1 it is a lock. Started at 0 it is a signal that makes one thread wait until another has
+finished something, which fixes the order of two actions. Started at \(N\) it is a counter of
+free resources, which let at most three cars into the parking lot. A wrong start value breaks
+each of them: 2 instead of 1 brings the race back, and 1 instead of 0 lets the reader run too
+early.
+
+\end{document}
