@@ -1,0 +1,221 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{9}
+\newcommand{\labtitle}{Watching System Calls with strace}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+A system call is the door between a program and the kernel. The purpose of this lab is to watch
+that door with \code{strace}, which prints every system call a program makes: first the calls of
+a real command, \code{ls -l}, then the calls of a small program of my own that uses \code{open},
+\code{write} and \code{read} directly, and finally to count one kind of call.
+
+The work was done on my Arch Linux laptop with gcc 16.2.1 and strace 7.3, in the folder
+\code{\textasciitilde/os-lab9}. In the listings, long runs of similar lines are shortened and
+marked.
+
+\section{Part 1. See the calls of a real command}
+
+\begin{lstlisting}[caption={The calls of ls -l (shortened)}]
+$ strace -f -e trace=openat,read,write,close ls -l
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+close(3)                                = 0
+openat(AT_FDCWD, "/usr/lib/libcap.so.2", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\320{\0\0\0\0\0\0"..., 1024) = 1024
+close(3)                                = 0
+openat(AT_FDCWD, "/usr/lib/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\300y\2\0\0\0\0\0"..., 1024) = 1024
+close(3)                                = 0
+[... locale files ...]
+openat(AT_FDCWD, ".", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3
+openat(AT_FDCWD, "/etc/passwd", O_RDONLY|O_CLOEXEC) = 4
+read(4, "root:x:0:0::/root:/usr/bin/bash\n"..., 4096) = 1715
+close(4)                                = 0
+openat(AT_FDCWD, "/etc/group", O_RDONLY|O_CLOEXEC) = 4
+read(4, "root:x:0:root\nsys:x:3:bin\nmem:x:"..., 4096) = 1004
+close(4)                                = 0
+[... user database lookups ...]
+close(3)                                = 0
+write(1, "total 4\n", 8)                = 8
+openat(AT_FDCWD, "/etc/localtime", O_RDONLY|O_CLOEXEC) = 3
+read(3, "TZif2\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\20\0\0\0\20\0\0\0\0"..., 4096) = 2424
+close(3)                                = 0
+write(1, "-rw-r--r-- 1 Nico Nico 1055 Nov "..., 52) = 52
+close(1)                                = 0
+close(2)                                = 0
++++ exited with 0 +++
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Counting the calls of one ls -l}]
+$ strace -f -e trace=openat,read,write,close ls -l 2>&1 >/dev/null | grep -c '^[a-z]*('
+101
+$ strace -c ls -l > /dev/null
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 12.71    0.000053           1        41           close
+  7.19    0.000030           0        44        13 openat
+  4.56    0.000019           0        34           fstat
+  3.84    0.000016           1        15           read
+  3.36    0.000014           0        36           mmap
+  2.16    0.000009           2         6           getdents64
+  0.48    0.000002           2         1           write
+[... 35 other system calls ...]
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000417           1       314        27 total
+\end{lstlisting}
+
+The burst at the beginning is not \code{ls} itself yet: the dynamic loader opens the shared
+libraries, then the C library opens the locale files. \code{ls} then opens the directory
+\code{.}, reads \code{/etc/passwd} and \code{/etc/group} to turn the numeric owner and group
+into names, reads \code{/etc/localtime} to print the dates, and only then writes.
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{How \code{ls} prints.} With the \code{write} system call, to descriptor 1,
+  standard output: \code{write(1, "total 4\textbackslash n", 8) = 8}, followed by one more
+  \code{write(1, ...)} for the line of the file.
+  \item \textbf{How many calls.} One simple \code{ls -l} made 101 calls of the four traced kinds
+  and 314 system calls in total, 27 of which returned an error (mostly files that do not exist
+  in the first place the library looks).
+\end{enumerate}
+
+\section{Part 2. A program that calls the kernel directly}
+
+\begin{lstlisting}[style=ccode,caption={syscalls.c}]
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+
+int main(void) {
+    const char *msg = "hello, kernel\n";
+    int fd = open("note.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) { perror("open"); return 1; }
+    printf("open returned descriptor %d\n", fd);
+    ssize_t n = write(fd, msg, strlen(msg));
+    printf("write sent %zd bytes\n", n);
+    close(fd);
+    fd = open("note.txt", O_RDONLY);
+    char buf[64];
+    n = read(fd, buf, sizeof(buf) - 1);
+    buf[n] = '\0';
+    printf("read got %zd bytes: %s", n, buf);
+    close(fd);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Compiling and running syscalls}]
+$ gcc -Wall -Wextra -o syscalls syscalls.c
+$ ./syscalls
+open returned descriptor 3
+write sent 14 bytes
+read got 14 bytes: hello, kernel
+\end{lstlisting}
+
+\begin{lstlisting}[caption={The same program seen with strace}]
+$ strace -e trace=openat,write,read,close ./syscalls
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+close(3)                                = 0
+openat(AT_FDCWD, "/usr/lib/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\300y\2\0\0\0\0\0"..., 1024) = 1024
+close(3)                                = 0
+openat(AT_FDCWD, "note.txt", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3
+write(1, "open returned descriptor 3\n", 27) = 27
+write(3, "hello, kernel\n", 14)         = 14
+write(1, "write sent 14 bytes\n", 20)   = 20
+close(3)                                = 0
+openat(AT_FDCWD, "note.txt", O_RDONLY)  = 3
+read(3, "hello, kernel\n", 63)          = 14
+write(1, "read got 14 bytes: hello, kernel"..., 33) = 33
+close(3)                                = 0
++++ exited with 0 +++
+\end{lstlisting}
+
+The first five lines are the setup: the loader opens the C library. After them come my calls.
+The C function \code{open} appears as the system call \code{openat}, and each \code{printf}
+line appears as a \code{write} to descriptor 1; the program's own text printed between the
+strace lines is left out of the figure.
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Why the descriptor is 3.} Descriptors 0, 1 and 2 are already open when the
+  program starts: standard input, standard output and standard error, inherited from the shell
+  that started it. The kernel always gives the smallest free number, so the first file the
+  program opens gets 3. After \code{close(3)} the number is free again, which is why the second
+  \code{openat} also returns 3.
+\end{enumerate}
+
+\section{Part 3. Count one kind of call}
+
+The handout I received ends after Part 2, so for this part I counted one kind of call,
+\code{write}, in my own program, using the summary mode of strace (\code{-c}).
+
+\begin{lstlisting}[caption={All the calls of syscalls, counted}]
+$ strace -c ./syscalls > /dev/null
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+  0.00    0.000000           0         2           read
+  0.00    0.000000           0         2           write
+  0.00    0.000000           0         4           close
+  0.00    0.000000           0         8           mmap
+  0.00    0.000000           0         4           openat
+[... 13 other system calls ...]
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000000           0        41         2 total
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Counting only write, on the terminal and redirected}]
+$ strace -c -e trace=write ./syscalls
+open returned descriptor 3
+write sent 14 bytes
+read got 14 bytes: hello, kernel
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+  0.00    0.000000           0         4           write
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000000           0         4           total
+$ strace -c -e trace=write ./syscalls > /dev/null
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000024          12         2           write
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000024          12         2           total
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{The count.} The whole program makes 41 system calls, although the source has
+  only 7; the rest is the start-up of the process. On the terminal there are 4 \code{write}
+  calls: one to the file and one for each of the three \code{printf} lines.
+  \item \textbf{The count depends on where the output goes.} With the output redirected, there
+  are only 2 \code{write} calls. \code{printf} is a library function with a buffer: on a
+  terminal it flushes at every newline, but into a file or \code{/dev/null} it keeps the three
+  lines and hands them to the kernel in a single \code{write} at exit. My direct \code{write}
+  to \code{note.txt} is always exactly one system call.
+\end{enumerate}
+
+\plainsection{Conclusions}
+
+With \code{strace} the border between a program and the kernel became visible. Even a simple
+\code{ls -l} crosses it 314 times: to load its libraries, to read the directory, to look up
+user names and the time zone, and finally to print with \code{write} on descriptor 1.
+Everything a program does outside its own memory is a system call.
+
+My own program showed the same from the inside. The C functions \code{open}, \code{write},
+\code{read} and \code{close} map directly to the calls \code{openat}, \code{write}, \code{read}
+and \code{close}, with the arguments I passed and the values I got back, and the first file
+received descriptor 3 because 0, 1 and 2 were already taken. Counting the calls also showed the
+difference between a system call and a library function: \code{write} always enters the kernel
+once, while \code{printf} decides by itself when to do it.
+
+\end{document}
