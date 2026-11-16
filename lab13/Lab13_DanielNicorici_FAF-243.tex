@@ -1,0 +1,343 @@
+\documentclass[11pt,a4paper]{article}
+\input{../template/utm-lab}
+
+\newcommand{\labnumber}{13}
+\newcommand{\labtitle}{Semaphores in Your Own Kernel}
+\newcommand{\studentname}{Daniel Nicorici}
+\newcommand{\studentgroup}{FAF-243}
+
+\begin{document}
+
+\utmtitlepage
+\tableofcontents
+\newpage
+
+\plainsection{Purpose of the work}
+
+In Labs 11 and 12 semaphores were used from the C library. The purpose of this lab is to build
+them inside the xv6 kernel, as three new system calls, \code{sem\_init}, \code{sem\_down} and
+\code{sem\_up} (numbers 24, 25 and 26), and to see that a semaphore is only a number, a
+spinlock that protects it, and the kernel's sleep and wakeup.
+
+The work was done in my \code{\textasciitilde/xv6-riscv} tree (\code{mit-pdos/xv6-riscv}, commit
+\code{06aad25}), which already contains \code{trace} from Lab 10 as call 23, cross-compiled with
+\code{riscv64-linux-gnu-gcc} 16.2.1 and run on QEMU 11.1.1 with 3 CPUs.
+
+\section{Part 1. The numbers and the user side}
+
+The same recipe as \code{trace} in Lab 10, three times. Semaphores are numbered 0 to 7 and are
+shared by all processes.
+
+\begin{lstlisting}[caption={The numbers, the declarations, the stubs and the UPROGS lines}]
+$ grep -n "sem_" kernel/syscall.h user/user.h user/usys.pl
+kernel/syscall.h:25:#define SYS_sem_init 24
+kernel/syscall.h:26:#define SYS_sem_down 25
+kernel/syscall.h:27:#define SYS_sem_up   26
+user/user.h:29:int sem_init(int, int);
+user/user.h:30:int sem_down(int);
+user/user.h:31:int sem_up(int);
+user/usys.pl:47:entry("sem_init");
+user/usys.pl:48:entry("sem_down");
+user/usys.pl:49:entry("sem_up");
+$ grep -n "_semtest\|_mix" Makefile
+151:	$U/_semtest\
+152:	$U/_mix\
+\end{lstlisting}
+
+\code{semtest} has two tests. In the first, semaphore 0 starts at 0, so the child must wait for
+the parent. In the second, ping and pong take turns with two semaphores that pass the turn to
+each other.
+
+\begin{lstlisting}[style=ccode,caption={user/semtest.c}]
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(void)
+{
+  sem_init(0, 0);
+  if (fork() == 0) {
+    sem_down(0);
+    printf("child: I ran after the parent\n");
+    exit(0);
+  }
+  pause(10);
+  printf("parent: done, I let the child go\n");
+  sem_up(0);
+  wait(0);
+
+  sem_init(1, 1);
+  sem_init(2, 0);
+  if (fork() == 0) {
+    for (int i = 1; i <= 3; i++) {
+      sem_down(2);
+      printf("  pong %d\n", i);
+      sem_up(1);
+    }
+    exit(0);
+  }
+  for (int i = 1; i <= 3; i++) {
+    sem_down(1);
+    printf("ping %d\n", i);
+    sem_up(2);
+  }
+  wait(0);
+  printf("semtest: OK\n");
+  exit(0);
+}
+\end{lstlisting}
+
+\begin{lstlisting}[style=ccode,caption={user/mix.c}]
+#include "kernel/types.h"
+#include "user/user.h"
+
+void
+lines(char *s, int uselock)
+{
+  for (int k = 0; k < 5; k++) {
+    if (uselock)
+      sem_down(3);
+    for (char *p = s; *p; p++)
+      write(1, p, 1);
+    if (uselock)
+      sem_up(3);
+  }
+}
+
+int
+main(int argc, char *argv[])
+{
+  int uselock = (argc > 1);
+  sem_init(3, 1);
+  if (fork() == 0) {
+    lines("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n", uselock);
+    exit(0);
+  }
+  lines("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n", uselock);
+  wait(0);
+  exit(0);
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Check 1: the calls reach a kernel that does not know them yet}]
+$ semtest
+3 semtest: unknown sys call 24
+4 semtest: unknown sys call 25
+child: I ran after the parent
+parent: done, I let the child go
+3 semtest: unknown sys call 26
+3 semtest: unknown sys call 24
+3 semtest: unknown sys call 24
+3 semtest: unknown sys call 25
+[... ping and pong mixed with the error lines ...]
+semtest: OK
+\end{lstlisting}
+
+The line of the child comes before the line of the parent: without semaphores the child ran
+first. That is what Part 2 fixes.
+
+\section{Part 2. The kernel side}
+
+\code{sem\_down} is the heart. While the value is 0, the process registers the address of the
+semaphore as the thing it waits for, lets go of the spinlock, and sleeps. \code{sem\_up} adds 1
+and wakes up everyone who sleeps on that address. This kernel sleeps in two steps,
+\code{sleep\_prepare(chan)} and then \code{sleep()}.
+
+\begin{lstlisting}[style=ccode,caption={kernel/sem.c}]
+#include "types.h"
+#include "riscv.h"
+#include "defs.h"
+#include "param.h"
+#include "spinlock.h"
+#include "proc.h"
+
+#define NSEM 8
+
+struct sem {
+  struct spinlock lock;
+  int value;
+};
+
+static struct sem sems[NSEM];
+
+uint64
+sys_sem_init(void)
+{
+  int id, value;
+  argint(0, &id);
+  argint(1, &value);
+  if (id < 0 || id >= NSEM || value < 0)
+    return -1;
+  acquire(&sems[id].lock);
+  sems[id].value = value;
+  release(&sems[id].lock);
+  return 0;
+}
+
+uint64
+sys_sem_down(void)
+{
+  int id;
+  argint(0, &id);
+  if (id < 0 || id >= NSEM)
+    return -1;
+  struct sem *s = &sems[id];
+
+  acquire(&s->lock);
+  while (s->value == 0) {
+    sleep_prepare(s);
+    release(&s->lock);
+    sleep();
+    acquire(&s->lock);
+    if (killed(myproc())) {
+      release(&s->lock);
+      return -1;
+    }
+  }
+  s->value--;
+  release(&s->lock);
+  return 0;
+}
+
+uint64
+sys_sem_up(void)
+{
+  int id;
+  argint(0, &id);
+  if (id < 0 || id >= NSEM)
+    return -1;
+  struct sem *s = &sems[id];
+
+  acquire(&s->lock);
+  s->value++;
+  wakeup(s);
+  release(&s->lock);
+  return 0;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={sem.o in the kernel and the three table entries}]
+$ grep -n "sem.o" Makefile
+21:  $K/sem.o \
+$ grep -n "sys_sem" kernel/syscall.c
+107:extern uint64 sys_sem_init(void);
+108:extern uint64 sys_sem_down(void);
+109:extern uint64 sys_sem_up(void);
+138:  [SYS_sem_init] = sys_sem_init,
+139:  [SYS_sem_down] = sys_sem_down,
+140:  [SYS_sem_up]   = sys_sem_up,
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Check 2: semtest}]
+$ semtest
+parent: done, I let the child go
+child: I ran after the parent
+ping 1
+  pong 1
+ping 2
+  pong 2
+ping 3
+  pong 3
+semtest: OK
+\end{lstlisting}
+
+The parent waits 10 ticks before it lets the child go, yet the child prints second: it was
+asleep in \code{sem\_down}. Ping and pong alternate strictly, three times each. With
+\code{trace} from Lab 10 the new calls can be watched directly (mask
+\(2^{25} + 2^{26} = 100663296\)):
+
+\begin{lstlisting}[caption={The semaphore calls of semtest, seen with trace}]
+$ trace 100663296 semtest
+parent: done, I let the child go
+12: syscall sem_up -> 0
+13: syscall sem_down -> 0
+child: I ran after the parent
+12: syscall sem_down -> 0
+ping 1
+12: syscall sem_up -> 0
+14: syscall sem_down -> 0
+  pong 1
+14: syscall sem_up -> 0
+12: syscall sem_down -> 0
+ping 2
+[... the same pattern for ping 2, pong 2, ping 3, pong 3 ...]
+semtest: OK
+\end{lstlisting}
+
+The \code{sem\_down} of the child (pid 13) returns only after the \code{sem\_up} of the parent
+(pid 12): the call was entered earlier, but it finished, and was printed, only when the child
+was woken.
+
+\section{Part 3. A semaphore as a lock: mix}
+
+\code{mix} starts two processes that each print five lines, one letter per \code{write()}
+system call. QEMU runs 3 CPUs, so the two processes really run at the same time.
+
+\begin{lstlisting}[caption={mix without the lock}]
+$ mix
+AAAAbbbAbbAbAbAbAbAbAbAbAbbbAAbAAAAAbAbAbAbAbAbAAAbAbAb
+bAbAbAbAbA
+AAbAbAbAbAbAbbAbAbAbAbbbAAbAbAbAbAbAbbAbbAbbbbbbbb
+bbAbAbAbAbAb
+bAbAbAbAbAbAbbAbAbAAAAbAbAbAbbbAbAbAbAbAbAbAbA
+AAAAbAbAbbAb
+bbbbAbAbAbAbAbAbAbAbbAbAbAbAbAbAbAbAbAbAbAbAbA
+AbAbAbAbAbAbAbAA
+bAbAbAbbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbA
+AAAAAAAA
+\end{lstlisting}
+
+\begin{lstlisting}[caption={mix with the lock}]
+$ mix lock
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+\end{lstlisting}
+
+\textbf{Observations:}
+\begin{enumerate}
+  \item \textbf{Why the letters mix.} One line costs 31 system calls: one \code{write()} for
+  each of the 30 letters and one for the newline. Between any two of them the other process, on
+  another CPU, can make its own \code{write()}, so the two lines are interleaved letter by
+  letter.
+  \item \textbf{The critical section.} \code{sem\_down(3);} before the inner loop and
+  \code{sem\_up(3);} after it. Semaphore 3 starts at 1, so only one process at a time can be
+  between the two calls, and a whole line is printed before the other process may start one.
+  \item \textbf{Why \code{while} and not \code{if}.} \code{wakeup(s)} wakes every process that
+  sleeps on \code{s}, but \code{sem\_up} added only one unit. The first process that gets the
+  spinlock takes the unit and the value is 0 again; the others wake up, find 0 and must sleep
+  again. A process that calls \code{sem\_down} without ever sleeping can also take the unit
+  before the woken one gets the lock. With \code{if} the value would go below 0.
+  \item \textbf{Why release before \code{sleep()}.} A spinlock is held with interrupts off, and
+  whoever else wants it spins on a CPU. If the process slept while holding \code{s->lock},
+  \code{sem\_up} could never acquire it to add 1 and call \code{wakeup}, so the sleeper would
+  never be woken and the CPU that called \code{sem\_up} would spin forever: a deadlock inside
+  the kernel. \code{sleep\_prepare} is called before the release so that a \code{sem\_up}
+  arriving in between is not missed.
+\end{enumerate}
+
+The optional \code{sem\_trydown} call was not done.
+
+\plainsection{Conclusions}
+
+Building semaphores in the kernel showed how little they are made of. Each one is an integer
+and a spinlock. Taking a unit is a loop: while the value is 0 the process records what it is
+waiting for, releases the spinlock and sleeps, using no CPU; giving a unit back is an increment
+and a wakeup. The user side is the recipe of Lab 10 repeated three times: a number, a
+declaration, a stub and a table entry.
+
+The two tests then reproduced Labs 11 and 12 on my own kernel. A semaphore that starts at 0
+made the child wait for the parent, two semaphores passed the turn between ping and pong, and
+a semaphore that starts at 1 turned a line of 31 separate system calls into a critical section,
+so the output of two processes on three CPUs stopped mixing. The questions about \code{while}
+and about releasing the spinlock before sleeping are the same lessons as the condition variable
+and the deadlock of Lab 12, seen this time from inside the kernel.
+
+\end{document}

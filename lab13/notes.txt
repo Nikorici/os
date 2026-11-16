@@ -1,0 +1,21 @@
+Lab 13 - Semaphores in Your Own Kernel (xv6)
+Daniel Nicorici, FAF-243. Full report with outputs: Lab13_DanielNicorici_FAF-243.pdf
+
+1. One line costs 31 system calls: mix prints one letter per write(), 30 letters and the
+   newline. Between any two of those calls the other process, running on another CPU, can
+   make its own write(), so the letters of the two lines mix.
+
+2. "sem_down(3);" before the inner loop and "sem_up(3);" after it. Semaphore 3 starts at 1,
+   so only one process at a time can be between them, and the whole line becomes a critical
+   section.
+
+3. wakeup(s) wakes every process that sleeps on s, but sem_up added only one unit. The first
+   process to get the spinlock takes it (value back to 0); the others wake up, find 0 and
+   must sleep again. A process that calls sem_down without sleeping can also take the unit
+   before a woken one gets the lock. "while" re-checks; "if" would let value go below 0.
+
+4. A spinlock is held with interrupts off, and anyone else who wants it spins. If the process
+   slept holding it, sem_up could never acquire s->lock to add 1 and call wakeup, so the
+   sleeper would never wake, and the CPU calling sem_up would spin forever: a deadlock.
+
+Optional sem_trydown was not done.
